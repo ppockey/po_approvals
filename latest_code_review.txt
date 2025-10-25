@@ -1,0 +1,3574 @@
+analyze the following code. tell me what it does and how it will come together to support a yet-to-be-written Angular frontend.
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalAuditRepository
+    {
+        Task InsertAsync(string poNumber, char oldStatus, char newStatus, string changedBy,
+                         string? note, int? sequence, string? roleCode, char? category,
+                         CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalChainRepository
+    {
+        Task<bool> ChainExistsAsync(string poNumber, CancellationToken ct);
+        Task CreateChainAsync(string poNumber, CancellationToken ct);
+        Task InsertStagesAsync(string poNumber, IEnumerable<(int Seq, string RoleCode)> stages, CancellationToken ct);
+
+        Task<(int Seq, string RoleCode)?> GetFirstPendingStageAsync(string poNumber, CancellationToken ct);
+        Task SetStageStatusAsync(string poNumber, int sequence, char newStatus, CancellationToken ct);
+        Task<bool> AllStagesApprovedAsync(string poNumber, CancellationToken ct);
+        Task FinalizeChainAsync(string poNumber, char finalStatus, CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalOutboxRepository
+    {
+        Task<IReadOnlyList<OutboxEventRow>> GetUnprocessedNewWaitingAsync(int top, CancellationToken ct);
+        Task MarkProcessedAsync(long outboxId, CancellationToken ct);
+        Task IncrementAttemptsAsync(long outboxId, CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalsDelegationOfAuthorityRepository
+    {
+        Task ReplaceDirectMaterialAsync(IEnumerable<Entities.POApprovals.SqlDelegationOfAuthorityDirectMaterial> rows, CancellationToken ct);
+        Task ReplaceIndirectExpenseAsync(IEnumerable<Entities.POApprovals.SqlDelegationOfAuthorityIndirectExpense> rows, CancellationToken ct);
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalsStagingRepository
+    {
+        Task InsertHeadersAsync(IEnumerable<PoStgHeader> rows, CancellationToken ct);
+
+        Task InsertLinesAsync(IEnumerable<PoStgLine> rows, CancellationToken ct);
+
+        Task TruncateStagingAsync(CancellationToken ct);
+
+        // calls dbo.PO_Merge
+        Task ExecuteMergeAsync(CancellationToken ct);
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_Approval_Audit", Schema = "dbo")]
+    public class PoApprovalAudit
+    {
+        [Key]
+        public long AuditId { get; set; }
+
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+
+        public char OldStatus { get; set; }
+        public char NewStatus { get; set; }
+
+        [MaxLength(100)]
+        public string ChangedBy { get; set; } = null!;
+
+        public DateTime ChangedAtUtc { get; set; }
+        public string? DecisionNote { get; set; }
+
+        public int? Sequence { get; set; }
+
+        [MaxLength(40)]
+        public string? RoleCode { get; set; }
+
+        public char? Category { get; set; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_ApprovalChain", Schema = "dbo")]
+    public class PoApprovalChain
+    {
+        [Key]
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+
+        public DateTime CreatedAtUtc { get; set; }
+        public char Status { get; set; } // 'P','A','D'
+        public DateTime? FinalizedAtUtc { get; set; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_ApprovalOutbox", Schema = "dbo")]
+    public class PoApprovalOutbox
+    {
+        [Key]
+        public long OutboxId { get; set; }
+
+        [MaxLength(40)]
+        public string EventType { get; set; } = null!;
+
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+
+        public DateTime OccurredAtUtc { get; set; }
+        public string? PayloadJson { get; set; }
+        public int Attempts { get; set; }
+        public DateTime? ProcessedAtUtc { get; set; }
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? DirectAmount { get; set; }
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? IndirectAmount { get; set; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_ApprovalStage", Schema = "dbo")]
+    public class PoApprovalStage
+    {
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+        public int Sequence { get; set; } // PK part
+
+        [MaxLength(40)]
+        public string RoleCode { get; set; } = null!;
+
+        [MaxLength(100)]
+        public string? ApproverUserId { get; set; }
+
+        public char? Category { get; set; } // 'I'/'D'/null
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? ThresholdFrom { get; set; }
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? ThresholdTo { get; set; }
+
+        public char Status { get; set; } // 'P','A','D','S'
+        public DateTime? DecidedAtUtc { get; set; }
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_Stg_Header")]
+    [Keyless]
+    public class PoStgHeader
+    {
+        public string? PoNumber { get; set; }
+
+        public DateTime? PoDate { get; set; }
+
+        public string? VendorNumber { get; set; }
+
+        public string? VendorName { get; set; }
+
+        public string? VendorAddr1 { get; set; }
+
+        public string? VendorAddr2 { get; set; }
+
+        public string? VendorAddr3 { get; set; }
+
+        public string? VendorState { get; set; }
+
+        public string? VendorPostalCode { get; set; }
+
+        public string? BuyerCode { get; set; }
+
+        public string? BuyerName { get; set; }
+
+        public string? HouseCode { get; set; }
+
+        public decimal? DirectAmount { get; set; }
+
+        public decimal? IndirectAmount { get; set; }
+
+        public DateTime? CreatedAtUtc { get; set; }
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_Stg_Line")]
+    [Keyless]
+    public class PoStgLine
+    {
+        public string? PoNumber { get; set; }
+
+        public int? LineNumber { get; set; }
+
+        public string? HouseCode { get; set; }
+
+        public string? ItemNumber { get; set; }
+
+        public string? ItemDescription { get; set; }
+
+        public string? ItemShortDescription { get; set; }
+
+        public decimal? QuantityOrdered { get; set; }
+
+        public string? OrderUom { get; set; }
+
+        public decimal? UnitCost { get; set; }
+
+        public decimal? ExtendedCost { get; set; }
+
+        public DateTime? RequiredDate { get; set; }
+
+        public string? GlAccount { get; set; }
+
+        public DateTime? CreatedAtUtc { get; set; }
+
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_DelegationOfAuthority_Direct_Material", Schema = "dbo")]
+    public record class SqlDelegationOfAuthorityDirectMaterial
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; init; }
+
+        [MaxLength(50)]
+        public string Level { get; init; } = null!;
+
+        [Column(TypeName = "decimal(19,4)")]
+        public decimal Amount { get; init; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_DelegationOfAuthority_Indirect_Expense", Schema = "dbo")]
+    public record class SqlDelegationOfAuthorityIndirectExpense
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; init; }
+
+        [MaxLength(50)]
+        public string Level { get; init; } = null!;
+
+        [Column(TypeName = "decimal(19,4)")]
+        public decimal Amount { get; init; }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalAuditConfiguration : IEntityTypeConfiguration<PoApprovalAudit>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalAudit> b)
+        {
+            b.ToTable("PO_Approval_Audit", "dbo");
+            b.HasKey(x => x.AuditId);
+
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+            b.Property(x => x.ChangedBy).HasMaxLength(100).IsRequired();
+            b.Property(x => x.ChangedAtUtc).HasDefaultValueSql("sysutcdatetime()");
+
+            b.HasIndex(x => new { x.PoNumber, x.Sequence, x.RoleCode, x.ChangedAtUtc })
+             .HasDatabaseName("IX_PO_Approval_Audit_PO_Stage");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalChainConfiguration : IEntityTypeConfiguration<PoApprovalChain>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalChain> b)
+        {
+            b.ToTable("PO_ApprovalChain", "dbo");
+            b.HasKey(x => x.PoNumber);
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+
+            b.Property(x => x.Status).HasDefaultValue('P');
+            b.Property(x => x.CreatedAtUtc).HasDefaultValueSql("sysutcdatetime()");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalOutboxConfiguration : IEntityTypeConfiguration<PoApprovalOutbox>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalOutbox> b)
+        {
+            b.ToTable("PO_ApprovalOutbox", "dbo");
+            b.HasKey(x => x.OutboxId);
+
+            b.Property(x => x.EventType).HasMaxLength(40).IsRequired();
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+            b.Property(x => x.OccurredAtUtc).HasDefaultValueSql("sysutcdatetime()");
+            b.Property(x => x.Attempts).HasDefaultValue(0);
+
+            // Matches your filtered unique index for unprocessed events:
+            b.HasIndex(x => new { x.EventType, x.PoNumber })
+             .HasDatabaseName("UX_PO_ApprovalOutbox_Unprocessed")
+             .IsUnique()
+             .HasFilter("[ProcessedAtUtc] IS NULL");
+
+            b.HasIndex(x => new { x.ProcessedAtUtc, x.Attempts })
+             .HasDatabaseName("IX_PO_ApprovalOutbox_Queued");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalStageConfiguration : IEntityTypeConfiguration<PoApprovalStage>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalStage> b)
+        {
+            b.ToTable("PO_ApprovalStage", "dbo");
+            b.HasKey(x => new { x.PoNumber, x.Sequence });
+
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+            b.Property(x => x.RoleCode).HasMaxLength(40).IsRequired();
+            b.Property(x => x.Status).HasDefaultValue('P');
+
+            b.HasIndex(x => new { x.PoNumber, x.Status, x.Sequence })
+             .HasDatabaseName("IX_PO_ApprovalStage_Po_Status_Seq");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsDelegationOfAuthorityDirectMaterialConfiguration
+    : IEntityTypeConfiguration<SqlDelegationOfAuthorityDirectMaterial>
+    {
+        public void Configure(EntityTypeBuilder<SqlDelegationOfAuthorityDirectMaterial> b)
+        {
+            b.ToTable("PO_DelegationOfAuthority_Direct_Material", "dbo");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Level).HasMaxLength(50).IsRequired();
+            b.Property(x => x.Amount).HasColumnType("decimal(19,4)").IsRequired();
+            b.HasIndex(x => x.Level).IsUnique();
+        }
+    }
+
+
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsDelegationOfAuthorityIndirectExpenseConfiguration
+        : IEntityTypeConfiguration<SqlDelegationOfAuthorityIndirectExpense>
+    {
+        public void Configure(EntityTypeBuilder<SqlDelegationOfAuthorityIndirectExpense> b)
+        {
+            b.ToTable("PO_DelegationOfAuthority_Indirect_Expense", "dbo");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Level).HasMaxLength(50).IsRequired();
+            b.Property(x => x.Amount).HasColumnType("decimal(19,4)").IsRequired();
+            b.HasIndex(x => x.Level).IsUnique();
+        }
+    }
+
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    internal class POApprovalsPoStgHeaderConfiguration : IEntityTypeConfiguration<PoStgHeader>
+    {
+        public void Configure(EntityTypeBuilder<PoStgHeader> builder)
+        {
+            builder.ToTable("PO_Stg_Header", "dbo");
+            builder.HasNoKey();
+            builder.Property(p => p.PoNumber).HasMaxLength(20);
+            builder.Property(p => p.VendorNumber).HasMaxLength(20);
+            builder.Property(p => p.VendorName).HasMaxLength(80);
+            builder.Property(p => p.VendorAddr1).HasMaxLength(80);
+            builder.Property(p => p.VendorAddr2).HasMaxLength(80);
+            builder.Property(p => p.VendorAddr3).HasMaxLength(80);
+            builder.Property(p => p.VendorState).HasMaxLength(20);
+            builder.Property(p => p.VendorPostalCode).HasMaxLength(20);
+            builder.Property(p => p.BuyerCode).HasMaxLength(10);
+            builder.Property(p => p.BuyerName).HasMaxLength(60);
+            builder.Property(p => p.HouseCode).HasMaxLength(10);
+            builder.Property(p => p.DirectAmount).HasColumnType("decimal(18,2)");
+            builder.Property(p => p.IndirectAmount).HasColumnType("decimal(18,2)");
+
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    internal class POApprovalsPoStgLineConfiguration : IEntityTypeConfiguration<PoStgLine>
+    {
+        public void Configure(EntityTypeBuilder<PoStgLine> builder)
+        {
+            builder.ToTable("PO_Stg_Line", "dbo");
+            builder.HasNoKey();
+            builder.Property(p => p.PoNumber).HasMaxLength(20);
+            builder.Property(p => p.LineNumber);
+            builder.Property(p => p.HouseCode).HasMaxLength(10);
+            builder.Property(p => p.ItemNumber).HasMaxLength(40);
+            builder.Property(p => p.ItemDescription).HasMaxLength(120);
+            builder.Property(p => p.ItemShortDescription).HasMaxLength(60);
+            builder.Property(p => p.QuantityOrdered).HasColumnType("decimal(18,4)");
+            builder.Property(p => p.OrderUom).HasMaxLength(12);
+            builder.Property(p => p.UnitCost).HasColumnType("decimal(18,4)");
+            builder.Property(p => p.ExtendedCost).HasColumnType("decimal(18,4)");
+            builder.Property(p => p.GlAccount).HasMaxLength(40);
+
+        }
+    }
+}
+
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalAuditRepository : IPoApprovalAuditRepository
+    {
+        private readonly PortalDbContext _db;
+        public PoApprovalAuditRepository(PortalDbContext db) => _db = db;
+
+        public async Task InsertAsync(string poNumber, char oldStatus, char newStatus, string changedBy,
+                                      string? note, int? sequence, string? roleCode, char? category,
+                                      CancellationToken ct)
+        {
+            _db.Set<PoApprovalAudit>().Add(new PoApprovalAudit
+            {
+                PoNumber = poNumber,
+                OldStatus = oldStatus,
+                NewStatus = newStatus,
+                ChangedBy = changedBy,
+                ChangedAtUtc = DateTime.UtcNow,
+                DecisionNote = note,
+                Sequence = sequence,
+                RoleCode = roleCode,
+                Category = category
+            });
+
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+}
+
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using System.Data;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalChainRepository : IPoApprovalChainRepository
+    {
+        private readonly PortalDbContext _db;
+        public PoApprovalChainRepository(PortalDbContext db) => _db = db;
+
+        public Task<bool> ChainExistsAsync(string poNumber, CancellationToken ct)
+            => _db.Set<PoApprovalChain>().AnyAsync(x => x.PoNumber == poNumber, ct);
+
+        public async Task CreateChainAsync(string poNumber, CancellationToken ct)
+        {
+            _db.Set<PoApprovalChain>().Add(new PoApprovalChain
+            {
+                PoNumber = poNumber,
+                Status = 'P',
+                CreatedAtUtc = DateTime.UtcNow
+            });
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task InsertStagesAsync(string poNumber, IEnumerable<(int Seq, string RoleCode)> stages, CancellationToken ct)
+        {
+            if (stages == null) return;
+
+            var entities = stages.Select(s => new PoApprovalStage
+            {
+                PoNumber = poNumber,
+                Sequence = s.Seq,
+                RoleCode = s.RoleCode,
+                Status = 'P'
+            }).ToList();
+
+            _db.Set<PoApprovalStage>().AddRange(entities);
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task<(int Seq, string RoleCode)?> GetFirstPendingStageAsync(string poNumber, CancellationToken ct)
+        {
+            var s = await _db.Set<PoApprovalStage>()
+                .AsNoTracking()
+                .Where(x => x.PoNumber == poNumber && x.Status == 'P')
+                .OrderBy(x => x.Sequence)
+                .Select(x => new { x.Sequence, x.RoleCode })
+                .FirstOrDefaultAsync(ct);
+
+            return s is null ? null : (s.Sequence, s.RoleCode);
+        }
+
+        public async Task SetStageStatusAsync(string poNumber, int sequence, char newStatus, CancellationToken ct)
+        {
+            // Only update if currently 'P' to mirror the WHERE Status='P' guard
+            var stage = await _db.Set<PoApprovalStage>()
+                .FirstOrDefaultAsync(x => x.PoNumber == poNumber && x.Sequence == sequence && x.Status == 'P', ct);
+            if (stage is null) return;
+
+            stage.Status = newStatus;
+            if (newStatus is 'A' or 'D' or 'S')
+                stage.DecidedAtUtc = DateTime.UtcNow;
+
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task<bool> AllStagesApprovedAsync(string poNumber, CancellationToken ct)
+        {
+            var anyPending = await _db.Set<PoApprovalStage>()
+                .AnyAsync(x => x.PoNumber == poNumber && x.Status == 'P', ct);
+
+            return !anyPending;
+        }
+
+        public async Task FinalizeChainAsync(string poNumber, char finalStatus, CancellationToken ct)
+        {
+            var chain = await _db.Set<PoApprovalChain>()
+                .FirstOrDefaultAsync(x => x.PoNumber == poNumber, ct);
+            if (chain is null) return;
+
+            chain.Status = finalStatus;
+            chain.FinalizedAtUtc = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.POApprovals.Models;
+using Microsoft.EntityFrameworkCore;
+using System.Data;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalOutboxRepository : IPoApprovalOutboxRepository
+    {
+        private readonly PortalDbContext _db;
+        private readonly ILoggerService _log;
+
+        public PoApprovalOutboxRepository(PortalDbContext db, ILoggerService log)
+            => (_db, _log) = (db, log);
+
+        public async Task<IReadOnlyList<OutboxEventRow>> GetUnprocessedNewWaitingAsync(int top, CancellationToken ct)
+        {
+            var rows = await _db.Set<PoApprovalOutbox>()
+                .AsNoTracking()
+                .Where(x => x.ProcessedAtUtc == null && x.EventType == "PO_NEW_WAITING")
+                .OrderBy(x => x.OutboxId)
+                .Take(top)
+                .Select(x => new OutboxEventRow(
+                    x.OutboxId,
+                    x.PoNumber,
+                    x.EventType,
+                    x.OccurredAtUtc,
+                    x.DirectAmount,
+                    x.IndirectAmount))
+                .ToListAsync(ct);
+
+            return rows;
+        }
+
+        public async Task MarkProcessedAsync(long outboxId, CancellationToken ct)
+        {
+            // Load, mutate, save
+            var entity = await _db.Set<PoApprovalOutbox>()
+                .FirstOrDefaultAsync(x => x.OutboxId == outboxId, ct);
+            if (entity is null) return;
+
+            entity.ProcessedAtUtc = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task IncrementAttemptsAsync(long outboxId, CancellationToken ct)
+        {
+            var entity = await _db.Set<PoApprovalOutbox>()
+                .FirstOrDefaultAsync(x => x.OutboxId == outboxId, ct);
+            if (entity is null) return;
+
+            entity.Attempts += 1;
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalsDelegationOfAuthorityRepository : IPoApprovalsDelegationOfAuthorityRepository
+    {
+        private readonly PortalDbContext _db;
+        private readonly ILoggerService _log;
+        private const string app = "ITTPortal.Infrastructure.Repositories.PoApprovalsDelegationOfAuthorityRepository";
+
+        public PoApprovalsDelegationOfAuthorityRepository(PortalDbContext db, ILoggerService log)
+            => (_db, _log) = (db, log);
+
+        public async Task ReplaceDirectMaterialAsync(
+    IEnumerable<SqlDelegationOfAuthorityDirectMaterial> rows,
+    CancellationToken ct)
+        {
+            var strategy = _db.Database.CreateExecutionStrategy();
+
+            await strategy.ExecuteAsync(async () =>
+            {
+                await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+                await _db.Database.ExecuteSqlRawAsync(
+                    "TRUNCATE TABLE [dbo].[PO_DelegationOfAuthority_Direct_Material];", ct);
+
+                await _db.Set<SqlDelegationOfAuthorityDirectMaterial>().AddRangeAsync(rows, ct);
+                await _db.SaveChangesAsync(ct);
+
+                await tx.CommitAsync(ct);
+            });
+
+            _log.Info($"{app} PoApprovalsDelegationOfAuthorityRepository replaced Direct Material rows: {rows.Count()}");
+        }
+
+
+        public async Task ReplaceIndirectExpenseAsync(
+    IEnumerable<SqlDelegationOfAuthorityIndirectExpense> rows,
+    CancellationToken ct)
+        {
+            var strategy = _db.Database.CreateExecutionStrategy();
+
+            await strategy.ExecuteAsync(async () =>
+            {
+                await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+                await _db.Database.ExecuteSqlRawAsync(
+                    "TRUNCATE TABLE [dbo].[PO_DelegationOfAuthority_Indirect_Expense];", ct);
+
+                await _db.Set<SqlDelegationOfAuthorityIndirectExpense>().AddRangeAsync(rows, ct);
+                await _db.SaveChangesAsync(ct);
+
+                await tx.CommitAsync(ct);
+            });
+
+            _log.Info($"{app} PoApprovalsDelegationOfAuthorityRepository replaced Indirect expense rows: {rows.Count()}");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using System.Data;
+using System.Diagnostics;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalsStagingRepository : IPoApprovalsStagingRepository
+    {
+        private const string app = "ITTPortal.Infrastructure.Repositories.PoApprovalsStagingRepository";
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public PoApprovalsStagingRepository(PortalDbContext db, ILoggerService log)
+        {
+            _db = db;
+            _log = log;
+        }
+
+        public Task ExecuteMergeAsync(CancellationToken ct)
+            => _db.Database.ExecuteSqlRawAsync("EXEC dbo.PO_Merge;", ct);
+
+        public async Task InsertHeadersAsync(IEnumerable<PoStgHeader> rows, CancellationToken ct)
+        {
+            var list = rows as ICollection<PoStgHeader> ?? rows.ToList();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                await BulkCopyAsync("dbo.PO_Stg_Header", BuildHeaderTable(list), ct);
+                sw.Stop();
+                _log.Info($"{app} BulkCopy headers ok. Count={list.Count}, elapsedMs={sw.ElapsedMilliseconds}", content: null);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($" {app} BulkCopy headers failed.", exception: ex);
+            }
+        }
+
+
+        public async Task InsertLinesAsync(IEnumerable<PoStgLine> rows, CancellationToken ct)
+        {
+            var list = rows as ICollection<PoStgLine> ?? rows.ToList();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                await BulkCopyAsync("dbo.PO_Stg_Line", BuildLineTable(list), ct);
+                sw.Stop();
+                _log.Info($"{app} BulkCopy lines ok. Count={list.Count}, elapsedMs={sw.ElapsedMilliseconds}", content: null);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($" {app} BulkCopy lines failed.", exception: ex);
+            }
+        }
+
+
+        public async Task TruncateStagingAsync(CancellationToken ct)
+        {
+            try
+            {
+                // Use plain SQL to avoid EF keyless limitations
+                await _db.Database.ExecuteSqlRawAsync("TRUNCATE TABLE dbo.PO_Stg_Line;", ct);
+                _log.Info($"{app} raw SQL TRUNCATE TABLE dbo.PO_Stg_Line ok.");
+                await _db.Database.ExecuteSqlRawAsync("TRUNCATE TABLE dbo.PO_Stg_Header;", ct);
+                _log.Info($"{app} raw SQL TRUNCATE TABLE dbo.PO_Stg_Header ok.");
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"{app} raw SQL TRUNCATE TABLE dbo.PO_Stg_Header, dbo.PO_stg_Heaer failed.", exception: ex);
+            }
+        }
+
+
+        // ---------- helpers ----------
+        private async Task BulkCopyAsync(string destination, DataTable table, CancellationToken ct)
+        {
+            var cn = (SqlConnection)_db.Database.GetDbConnection();
+            var openedHere = cn.State != ConnectionState.Open;
+            if (openedHere) await cn.OpenAsync(ct);
+
+            try
+            {
+                using var bc = new SqlBulkCopy(
+                    cn,
+                    SqlBulkCopyOptions.TableLock | SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.FireTriggers,
+                    null)
+                {
+                    DestinationTableName = destination,
+                    BatchSize = 5000,
+                    BulkCopyTimeout = 0
+                };
+
+                foreach (DataColumn c in table.Columns)
+                    bc.ColumnMappings.Add(c.ColumnName, c.ColumnName);
+
+                await bc.WriteToServerAsync(table, ct);
+            }
+            finally
+            {
+                if (openedHere) await cn.CloseAsync();
+            }
+        }
+
+        private static DataTable BuildHeaderTable(IEnumerable<PoStgHeader> rows)
+        {
+            var t = new DataTable();
+            t.Columns.Add("PoNumber", typeof(string));
+            t.Columns.Add("PoDate", typeof(DateTime));
+            t.Columns.Add("VendorNumber", typeof(string));
+            t.Columns.Add("VendorName", typeof(string));
+            t.Columns.Add("VendorAddr1", typeof(string));
+            t.Columns.Add("VendorAddr2", typeof(string));
+            t.Columns.Add("VendorAddr3", typeof(string));
+            t.Columns.Add("VendorState", typeof(string));
+            t.Columns.Add("VendorPostalCode", typeof(string));
+            t.Columns.Add("BuyerCode", typeof(string));
+            t.Columns.Add("BuyerName", typeof(string));
+            t.Columns.Add("HouseCode", typeof(string));
+            t.Columns.Add("DirectAmount", typeof(decimal));
+            t.Columns.Add("IndirectAmount", typeof(decimal));
+            t.Columns.Add("CreatedAtUtc", typeof(DateTime));
+
+            foreach (var r in rows)
+            {
+                t.Rows.Add(
+                    (object?)r.PoNumber ?? DBNull.Value,
+                    (object?)r.PoDate ?? DBNull.Value,
+                    (object?)r.VendorNumber ?? DBNull.Value,
+                    (object?)r.VendorName ?? DBNull.Value,
+                    (object?)r.VendorAddr1 ?? DBNull.Value,
+                    (object?)r.VendorAddr2 ?? DBNull.Value,
+                    (object?)r.VendorAddr3 ?? DBNull.Value,
+                    (object?)r.VendorState ?? DBNull.Value,
+                    (object?)r.VendorPostalCode ?? DBNull.Value,
+                    (object?)r.BuyerCode ?? DBNull.Value,
+                    (object?)r.BuyerName ?? DBNull.Value,
+                    (object?)r.HouseCode ?? DBNull.Value,
+                    (object?)r.DirectAmount ?? DBNull.Value,
+                    (object?)r.IndirectAmount ?? DBNull.Value,
+                    (object?)r.CreatedAtUtc ?? DBNull.Value
+                );
+            }
+            return t;
+        }
+
+        private static DataTable BuildLineTable(IEnumerable<PoStgLine> rows)
+        {
+            var t = new DataTable();
+            t.Columns.Add("PoNumber", typeof(string));
+            t.Columns.Add("LineNumber", typeof(int));
+            t.Columns.Add("HouseCode", typeof(string));
+            t.Columns.Add("ItemNumber", typeof(string));
+            t.Columns.Add("ItemDescription", typeof(string));
+            t.Columns.Add("ItemShortDescription", typeof(string));
+            t.Columns.Add("QuantityOrdered", typeof(decimal));
+            t.Columns.Add("OrderUom", typeof(string));
+            t.Columns.Add("UnitCost", typeof(decimal));
+            t.Columns.Add("ExtendedCost", typeof(decimal));
+            t.Columns.Add("RequiredDate", typeof(DateTime));
+            t.Columns.Add("GlAccount", typeof(string));
+
+            foreach (var r in rows)
+            {
+                t.Rows.Add(
+                    (object?)r.PoNumber ?? DBNull.Value,
+                    (object?)r.LineNumber ?? DBNull.Value,
+                    (object?)r.HouseCode ?? DBNull.Value,
+                    (object?)r.ItemNumber ?? DBNull.Value,
+                    (object?)r.ItemDescription ?? DBNull.Value,
+                    (object?)r.ItemShortDescription ?? DBNull.Value,
+                    (object?)r.QuantityOrdered ?? DBNull.Value,
+                    (object?)r.OrderUom ?? DBNull.Value,
+                    (object?)r.UnitCost ?? DBNull.Value,
+                    (object?)r.ExtendedCost ?? DBNull.Value,
+                    (object?)r.RequiredDate ?? DBNull.Value,
+                    (object?)r.GlAccount ?? DBNull.Value
+                );
+            }
+            return t;
+        }
+    }
+}
+
+using ITTPortal.Core.BuyersPortal.Entities;
+using ITTPortal.Core.Entities;
+using ITTPortal.Core.Entities.Holidays;
+using ITTPortal.Core.Entities.Sievo;
+using ITTPortal.Core.Entities.SSA;
+using ITTPortal.Infrastructure.Configurations;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+
+namespace ITTPortal.Infrastructure
+{
+    public class PortalDbContext : DbContext
+    {
+        private readonly IConfiguration _config;
+
+        public PortalDbContext() : base() { }
+        public PortalDbContext(DbContextOptions<PortalDbContext> options, IConfiguration config) : base(options)
+        {
+            _config = config;
+        }
+
+        protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+        {
+            optionsBuilder.UseSqlServer(
+                _config.GetConnectionString("DefaultConnection"),
+                sqlServerOptionsAction: sqlOptions =>
+                {
+                    sqlOptions.EnableRetryOnFailure();
+                    //maxRetryCount: 10,
+                    //maxRetryDelay: TimeSpan.FromSeconds(5),
+                    //errorNumbersToAdd: null);
+                }
+            );
+        }
+
+        public DbSet<Role> Roles { get; set; }
+        public DbSet<ParLogs> ParLogs { get; set; }
+        public DbSet<UserRole> UserRoles { get; set; }
+        public DbSet<UserModule> UserModules { get; set; }
+        public DbSet<Permission> Permissions { get; set; }
+        public DbSet<RolePermission> RolePermissions { get; set; }
+        public DbSet<Usr> Users { get; set; }
+        public DbSet<Country> Country { get; set; }
+        public DbSet<State> States { get; set; }
+        public DbSet<City> Cities { get; set; }
+        public DbSet<Employee> Employees { get; set; }
+        public DbSet<EmployeeLeave> EmployeeLeaves { get; set; }
+        public DbSet<LeaveRequest> LeaveRequests { get; set; }
+        public DbSet<DayOff> DayOffs { get; set; }
+        public DbSet<LeaveType> LeaveTypes { get; set; }
+        public DbSet<LeaveTypeRule> LeaveTypeRules { get; set; }
+        public DbSet<CountryEmployee> CountryEmployees { get; set; }
+        public DbSet<BusinessUnit> BusinessUnits { get; set; }
+        public DbSet<BusinessUnitEmployee> BusinessUnitEmployees { get; set; }
+        public DbSet<ServiceType> ServiceTypes { get; set; }
+        public DbSet<Office> Offices { get; set; }
+        public DbSet<OfficeContact> OfficeContacts { get; set; }
+        public DbSet<OfficeServiceArea> OfficeServiceAreas { get; set; }
+        public DbSet<OfficeServiceAreaView> OfficeServiceAreaViews { get; set; }
+        public DbSet<FaqCategory> FaqCategories { get; set; }
+        public DbSet<Faq> Faqs { get; set; }
+        public DbSet<ContactTicket> ContactTickets { get; set; }
+        public DbSet<HitCounter> HitCounters { get; set; }
+        public DbSet<County> Counties { get; set; }
+        public DbSet<ZipCode> ZipCodes { get; set; }
+        public DbSet<Announcement> Announcements { get; set; }
+        public DbSet<RMARequest> RMARequests { get; set; }
+        public DbSet<RMAStatus> RMAStatuses { get; set; }
+        public DbSet<Disposition> Dispositions { get; set; }
+        public DbSet<RMASalePerson> RMASalePersons { get; set; }
+        public DbSet<SDARSupplier> SDARSuppliers { get; set; }
+        public DbSet<CAPRequest> CAPRequests { get; set; }
+        public DbSet<Udl> Udls { get; set; }
+        public DbSet<UdlValue> UdlValues { get; set; }
+        public DbSet<UdlDetailValue> UdlDetailValues { get; set; }
+        public DbSet<Tag> Tags { get; set; }
+        public DbSet<TagEmployee> TagEmployees { get; set; }
+        public DbSet<TagViewEmployee> TagViewEmployees { get; set; }
+        public DbSet<Supplier> Suppliers { get; set; }
+
+        public DbSet<UdlValuePermission> UdlValuePermission { get; set; }
+        public DbSet<RulesControls> RulesControls { get; set; }
+        public DbSet<CronJob> CronJobs { get; set; }
+
+        public DbSet<CronJobServiceBus> CronJobServiceBus { get; set; }
+        public DbSet<UserProfile> UserProfiles { get; set; }
+
+        public DbSet<Question> Questions { get; set; }
+        public DbSet<Answer> Answer { get; set; }
+        public DbSet<BaseSupplier> BaseSuppliers { get; set; }
+        public DbSet<SSASupplier> SSASuppliers { get; set; }
+        public DbSet<SupplierContact> SupplierContacts { get; set; }
+        public DbSet<SSAApprover> SSAApprovers { get; set; }
+        public DbSet<SSAHighRiskTeam> SSAHighRiskTeams { get; set; }
+        public DbSet<SSASupplierApprover> SSASupplierApprovers { get; set; }
+
+        public DbSet<SSASupplierValueCenter> SSASupplierValueCenters { get; set; }
+        public DbSet<RenewalSurvey> SSARenewalSurveys { get; set; }
+
+        public DbSet<ReSubmittedLegalSurvey> ReSubmittedLegalSurveys { get; set; }
+        public DbSet<LegalSurvey> LegalSurveys { get; set; }
+        public DbSet<RenewalLegalSurvey> RenewalLegalSurveys { get; set; }
+        public DbSet<SSALegalSurveyUploadedDocument> SSALegalSurveyUploadedDocuments { get; set; }
+
+        public DbSet<SSAUploadedDocument> SSAUploadedDocument { get; set; }
+        public DbSet<BaseUploadedDocument> UploadedDocument { get; set; }
+        public DbSet<ReSubmitedSurvey> ReSubmitedSurveys { get; set; }
+        public DbSet<CLMSupplier> CLMSuppliers { get; set; }
+        public DbSet<CLMOwner> CLMOwners { get; set; }
+        public DbSet<CLMVcItLeader> CLMVcItLeaders { get; set; }
+        public DbSet<CLMStakeholder> CLMStakeholders { get; set; }
+        public DbSet<CLMSupplierOwner> CLMSupplierOwners { get; set; }
+        public DbSet<CLMSupplierStakeHolder> CLMSupplierStakeHolders { get; set; }
+        public DbSet<CLMContract> CLMContracts { get; set; }
+        public DbSet<CLMContractHistory> CLMContractHistories { get; set; }
+        public DbSet<CLMContractEmailLog> CLMContractEmailLogs { get; set; }
+        public DbSet<CLMContractReminder> CLMContractReminders { get; set; }
+        public DbSet<CLMContractObligation> CLMContractObligations { get; set; }
+        public DbSet<CLMContractDocument> CLMContractDocuments { get; set; }
+        public DbSet<CLMContractStakeholder> CLMContractStakeholders { get; set; }
+        public DbSet<CLMContractVC> CLMContractValueCenters { get; set; }
+        public DbSet<CLMProductCategory> CLMProductCategories { get; set; }
+        public DbSet<CLMDepartment> CLMDepartments { get; set; }
+        public DbSet<CLMContractEvent> CLMContractEvents { get; set; }
+        public DbSet<CLMContractEventNote> CLMContractEventNotes { get; set; }
+        public DbSet<CLMContractEventTask> CLMContractEventTasks { get; set; }
+        public DbSet<CLMContractEventHist> CLMContractEventHistories { get; set; }
+
+        public DbSet<CLMRenewalType> CLMRenewTypes { get; set; }
+
+        public DbSet<CodeOfConduct> CodeOfConduct { get; set; }
+        public DbSet<SupplierRequirement> SupplierRequirements { get; set; }
+        public DbSet<RequirementUploadedDocument> RequirementUploadedDocuments { get; set; }
+        public DbSet<SupplierRequirementResponse> SupplierRequirementResponses { get; set; }
+        public DbSet<RequirementResponseException> RequirementResponseExceptions { get; set; }
+        public DbSet<SSASupplierSite> SSASupplierSites { get; set; }
+        public DbSet<SSASupplierBusinessUnit> SSASupplierBusinessUnits { get; set; }
+        public DbSet<SSARequirementValueCenter> SSARequirementValueCenters { get; set; }
+        public DbSet<SSARequirementSites> SSARequirementSites { get; set; }
+        public DbSet<SSARequirementBusinessUnit> SSARequirementBusinessUnits { get; set; }
+        public DbSet<SSASite> SSASites { get; set; }
+        public DbSet<SSAFaq> SSAFaqs { get; set; }
+        public DbSet<SSAFaqCategory> SSAFaqCategories { get; set; }
+
+        public DbSet<SSAFaqCategoryTypes> SSAFaqCategoryTypes { get; set; }
+        public DbSet<ContactUsRequest> ContactUsRequests { get; set; }
+        public DbSet<SSARegisterRequest> SSARegisterRequests { get; set; }
+        public DbSet<SSASiteBusinessUnit> SSASiteBusinessUnits { get; set; }
+        public DbSet<SSABusinessUnit> SSABusinessUnits { get; set; }
+        public DbSet<SSABusinessUnitValueCenter> SSABusinessUnitValueCenters { get; set; }
+        public DbSet<Calendar> Calendars { get; set; }
+        public DbSet<Project> Projects { get; set; }
+        public DbSet<ProjectTask> ProjectTasks { get; set; }
+        public DbSet<ProjectTaskSyncFusion> ProjectTaskSyncFusion { get; set; }
+        public DbSet<ProjectResource> ProjectResources { get; set; }
+        public DbSet<TaskDependency> TaskDependencies { get; set; }
+        public DbSet<TaskAssignee> TaskAssignees { get; set; }
+        public DbSet<ProjectAssignee> ProjectAssignees { get; set; }
+        public DbSet<ProjectDocument> ProjectDocuments { get; set; }
+        public DbSet<ProjectDocCategory> ProjectDocCategories { get; set; }
+        public DbSet<SSACompanyProfile> SSACompanyProfiles { get; set; }
+        public DbSet<SSACompanyProfileUploadedDocument> SSACompanyProfileUploadedDocuments { get; set; }
+        public DbSet<SSASupplierDocument> SSASupplierDocuments { get; set; }
+        //public DbSet<SSASupplierDocumentResponse> SSASupplierDocumentResponses { get; set; }
+        public DbSet<SSASupplierDocumentBusinessUnit> SSASupplierDocumentBusinessUnits { get; set; }
+        public DbSet<SSASupplierDocumentSite> SSASupplierDocumentSites { get; set; }
+        public DbSet<SSASupplierDocumentValueCenter> SSASupplierDocumentValueCenters { get; set; }
+        public DbSet<SSASupplierDocumentUploadedDocument> SSASupplierDocumentUploadedDocuments { get; set; }
+
+        public DbSet<RenewalSSADocument> RenewalSSADocuments { get; set; }
+        public DbSet<SSASupplierNotification> SSASupplierNotifications { get; set; }
+        public DbSet<SSASupplierNotificationSupplier> SSASupplierNotificationSuppliers { get; set; }
+        public DbSet<SSASupplierNotificationUploadedDocument> SSASupplierNotificationUploadedDocuments { get; set; }
+        public DbSet<UserAssignment> UserAssignments { get; set; }
+
+        public DbSet<PMNSupplier> PMNSuppliers { get; set; }
+        public DbSet<PMNApprover> PMNApprovers { get; set; }
+        public DbSet<PMNSupplierApprover> PMNSupplierAppovers { get; set; }
+        public DbSet<PMNSupplierDocument> PMNSupplierDocuments { get; set; }
+        public DbSet<PMNSupplierDocEmailLog> PMNSupplierDocEmailLogs { get; set; }
+        public DbSet<PMNDocumentType> PMNDocumentTypes { get; set; }
+        public DbSet<PMNPart> PMNParts { get; set; }
+        public DbSet<PMNPartApprover> PMNPartAppovers { get; set; }
+        public DbSet<PMNPartDocument> PMNPartDocuments { get; set; }
+
+        public DbSet<PMNSupplierPart> PMNSupplierParts { get; set; }
+        public DbSet<PMNSupplierPartChangeAction> PMNSupplierPartChangeActions { get; set; }
+        public DbSet<PMNSupplierPartType> PMNSupplierPartTypes { get; set; }
+        public DbSet<PMNSupplierPartTypeDoc> PMNSupplierPartTypeDocs { get; set; }
+        public DbSet<PMNSupplierPartDelivery> PMNSupplierPartDeliveries { get; set; }
+        public DbSet<PMNSupplierPartDeliveryDoc> PMNSupplierPartDeliveryDocs { get; set; }
+
+
+        public DbSet<Calibration> Calibrations { get; set; }
+        public DbSet<CalibrationEmployee> CalibrationEmployees { get; set; }
+        public DbSet<CalibrationYear> CalibrationYears { get; set; }
+        public DbSet<FRCUploadedDocument> FRCUploadedDocuments { get; set; }
+        public DbSet<FRCFaq> FRCFaqs { get; set; }
+        public DbSet<FRCFaqCategory> FRCFaqCategories { get; set; }
+        public DbSet<FRCFaqCategoryTypes> FRCFaqCategoryTypes { get; set; }
+
+        public DbSet<SupplierShareFile> SupplierShareFiles { get; set; }
+        public DbSet<SupplierShareFileAccessRule> SupplierShareFileAccessRules { get; set; }
+
+        public DbSet<FRCPaymentHistory> FRCPaymentHistory { get; set; }
+        public DbSet<FRCInvoiceStatus> FRCInvoiceStatus { get; set; }
+        public DbSet<FRCVendorInfo> FRCVendorInfo { get; set; }
+        public DbSet<FRCCurYrInvoices> FRCCurYrInvoices { get; set; }
+        public DbSet<FRCInvoicePoStatus> FRCInvoicePoStatus { get; set; }
+        public DbSet<FRCInvoiceLineItem> FRCInvoiceLineItem { get; set; }
+        public DbSet<FRCDolApT> FRCDolApT { get; set; }
+        public DbSet<FRCValueCentersFilter> FRCValueCentersFilter { get; set; }
+        public DbSet<FRCBusinessUnitsFilter> FRCBusinessUnitsFilter { get; set; }
+        public DbSet<FRCVendorNamesFilter> FRCVendorNamesFilter { get; set; }
+        public DbSet<FRCVendorNumFilter> FRCVendorNumFilter { get; set; }
+        public DbSet<FRCDocumentStatusFilter> FRCDocumentStatusFilter { get; set; }
+        public DbSet<FRCDocumentNumberFilter> FRCDocumentNumberFilter { get; set; }
+
+        public DbSet<FRCCompaniesFilter> FRCCompaniesFilter { get; set; }
+
+        public DbSet<FRCCreditStatusFilter> FRCCreditStatusFilter { get; set; }
+        public DbSet<FRCCustNoFilter> FRCCustNoFilter { get; set; }
+        public DbSet<FRCOsEntityFilter> FRCOsEntityFilter { get; set; }
+        public DbSet<FRCPurOrderFilter> FRCPurOrderFilter { get; set; }
+        public DbSet<FRCRefDocNoFilter> FRCRefDocNoFilter { get; set; }
+        public DbSet<FRCSalesAreaFilter> FRCSalesAreaFilter { get; set; }
+        public DbSet<FRCSalesAreaDescFilter> FRCSalesAreaDescFilter { get; set; }
+        public DbSet<FRCStatusDescFilter> FRCStatusDescFilter { get; set; }
+        public DbSet<FRCCustomerInfo> FRCCustomerInfo { get; set; }
+        public DbSet<FRCCustomerFinancialSummary> FRCCustomerFinancialSummary { get; set; }
+        public DbSet<FRCCustomerFinancialDetail> FRCCustomerFinancialDetail { get; set; }
+        public DbSet<FRCArRowLvlSecurity> FRCArRowLvlSecurity { get; set; }
+        public DbSet<FRCApRowLvlSecurity> FRCApRowLvlSecurity { get; set; }
+        public DbSet<FRCTeamMember> FRCTeamMember { get; set; }
+        public DbSet<FRCCalendarDate> FRCCalendarDates { get; set; }
+        public DbSet<EmployeeSignature> EmployeeSignatures { get; set; }
+        public DbSet<EAModule> EAModules { get; set; }
+        public DbSet<EAProcess> EAProcesses { get; set; }
+        public DbSet<EAProcessActor> EAProcessActors { get; set; }
+        public DbSet<EAProcessRequest> EAProcessRequests { get; set; }
+        public DbSet<EAProcessRequestTransLog> EAProcessRequestTransLogs { get; set; }
+        public DbSet<EAProcessStatus> EAProcessStatuses { get; set; }
+        public DbSet<EATemplate> EATemplates { get; set; }
+        public DbSet<EATemplateField> EATemplateFields { get; set; }
+
+        #region Ongoarding
+        public DbSet<OnboardingEmployee> OnboardingEmployees { get; set; }
+        public DbSet<OnboardingResource> OnboardingResources { get; set; }
+        public DbSet<JobFamily> JobFamilies { get; set; }
+        public DbSet<JobFamilyGroup> JobFamilyGroups { get; set; }
+        public DbSet<JobProfile> JobProfiles { get; set; }
+        public DbSet<OnboardingSite> OnboardingSites { get; set; }
+        public DbSet<OnboardingJobFamilyResource> JobFamilyResources { get; set; }
+
+        public DbSet<OnboardingResourceDetail> OnboardingResourceDetails { get; set; }
+        public DbSet<OnboardingResourceValueCenter> OnboardingResourceValueCenters { get; set; }
+        public DbSet<OnboardingResourceDetailSite> OnboardingResourceDetailSites { get; set; }
+        public DbSet<OnboardingEmployeeJobFamilyResource> OnboardingEmployeeResources { get; set; }
+        public DbSet<OnboardingEmployeeResourcesSnapShot> OnboardingEmployeeResourcesSnapShots { get; set; }
+        public DbSet<EmployeeValueCenter> EmployeeValueCenters { get; set; }
+        #endregion
+
+        #region PCN
+
+        public DbSet<PCNCategory> PCNCategories { get; set; }
+        public DbSet<PCNDepartment> PCNDepartments { get; set; }
+        public DbSet<PCNEmployee> PCNEmployees { get; set; }
+        public DbSet<PCNEmailEmployee> PCNEmailEmployees { get; set; }
+
+        public DbSet<PCNProject> PCNProjects { get; set; }
+        public DbSet<PCNProjectDocument> PCNProjectDocuments { get; set; }
+        public DbSet<PCNProjectCategory> PCNProjectCategories { get; set; }
+        public DbSet<PCNProjectPhase> PCNProjectPhases { get; set; }
+        public DbSet<PCNProjectPhaseDoc> PCNProjectPhaseDocs { get; set; }
+
+        #endregion
+
+        #region CCA
+        public DbSet<CCAEmployee> CCAEmployees { get; set; }
+        public DbSet<CCAEmailEmployee> CCAEmailEmployees { get; set; }
+        public DbSet<CCACostCenter> CCACostCenters { get; set; }
+        public DbSet<CCACostCenterHistory> CCACostCenterHistories { get; set; }
+        public DbSet<CCAActivityType> CCAActivityTypes { get; set; }
+        public DbSet<CCAAccount> CCAAccounts { get; set; }
+        public DbSet<CCATransaction> CCATransactions { get; set; }
+        public DbSet<CCATransactionDocument> CCATransactionDocuments { get; set; }
+        public DbSet<CCACostDriver> CCACostDrivers { get; set; }
+        public DbSet<CCACostAllocation> CCACostAllocations { get; set; }
+        public DbSet<CCASiteCode> CCASiteCodes { get; set; }
+        public DbSet<CCAAccountSC> CCAAccountSCs { get; set; }
+
+        #endregion
+
+        #region PPM
+        //public DbSet<PPMStep> PPMSteps { get; set; }
+        //public DbSet<PPMTeam> PPMTeams { get; set; }
+        public DbSet<PPMTeamMember> PPMTeamMembers { get; set; }
+        public DbSet<PPMDepartment> PPMDepartments { get; set; }
+        public DbSet<PPMSite> PPMSites { get; set; }
+        public DbSet<PPMBusinessUnit> PPMBusinessUnits { get; set; }
+        public DbSet<PPMProject> PPMProjects { get; set; }
+        public DbSet<PPMProjectTransactionLog> PPMProjectTransactionLogs { get; set; }
+        public DbSet<PPMProjectUploadedDocument> PPMProjectUploadedDocuments { get; set; }
+        public DbSet<PPMProjectBPOStakeholderLog> PPMProjectBPOStakeholderLogs { get; set; }
+        public DbSet<PPMProjectITReviewerLog> PPMProjectITReviewerLogs { get; set; }
+        public DbSet<PPMCriteriaWeight> PPMCriteriaWeights { get; set; }
+        public DbSet<PPMProjectScore> PPMProjectScores { get; set; }
+        public DbSet<PPMValueCenter> PPMValueCenters { get; set; }
+        public DbSet<PPMProjectType> PPMProjectTypes { get; set; }
+        public DbSet<PPMBRMEmployee> PPMBRMEmployees { get; set; }
+        public DbSet<PPMBusinessUnitLocation> PPMBusinessUnitLocations { get; set; }
+
+        #endregion
+
+        #region Sievo Sets
+
+        public DbSet<SievoSupplier> SP_DEV_VM { get; set; }
+        public DbSet<SievoSupplierLocation> SP_DEV_WG { get; set; }
+        //public DbSet<SievoSupplierPartInfo> SievoSupplierPartsInfo { get; set; }
+        #endregion
+
+        #region Entity List
+        public DbSet<EntityList> EntityLists { get; set; }
+        #endregion
+
+
+        #region Document Storage Sets 
+
+        DbSet<FileMeta> FilesMeta { get; set; }
+        DbSet<FileBytes> FilesBytes { get; set; }
+        #endregion
+
+
+        #region POApprovals
+
+        public DbSet<Core.Entities.POApprovals.PoStgHeader> PoStgHeaders { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoStgLine> PoStgLines { get; set; }
+        public DbSet<Core.Entities.POApprovals.SqlDelegationOfAuthorityDirectMaterial> PoDelegationOfAuthorityDirectMaterials { get; set; }
+        public DbSet<Core.Entities.POApprovals.SqlDelegationOfAuthorityIndirectExpense> PoDelegationOfAuthorityIndirectExpenses { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalChain> PoApprovalChains { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalStage> PoApprovalStages { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalOutbox> PoApprovalOutboxes { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalAudit> PoApprovalAudits { get; set; }
+
+        #endregion
+
+        public DbSet<SSASelfEvaluation> SSASelfEvaluations { get; set; }
+        public DbSet<SSASelfEvaluationUploadedDocument> SSASelfEvaluationUploadedDocuments { get; set; }
+        public DbSet<SupplierPartInfo> SuppliersPartInfo { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder builder)
+        {
+            base.OnModelCreating(builder);
+
+            builder.ApplyConfiguration(new RoleConfiguration());
+            builder.ApplyConfiguration(new RolePermissionConfiguration());
+            builder.ApplyConfiguration(new CountryEmployeeConfiguration());
+            builder.ApplyConfiguration(new TagEmployeeConfiguration());
+            builder.ApplyConfiguration(new TagViewEmployeeConfiguration());
+            builder.ApplyConfiguration(new CLMContractVCConfiguration());
+            builder.ApplyConfiguration(new BusinessUnitEmployeeConfiguration());
+            builder.ApplyConfiguration(new UserModuleConfiguration());
+            builder.ApplyConfiguration(new PCNProjectCategoryConfiguration());
+            builder.ApplyConfiguration(new JobFamilyResourceConfiguration());
+            builder.ApplyConfiguration(new CCAAccountSCConfiguration());
+
+            // POApprovals configurations
+            builder.ApplyConfiguration(new POApprovalsPoStgHeaderConfiguration());
+            builder.ApplyConfiguration(new POApprovalsPoStgLineConfiguration());
+            builder.ApplyConfiguration(new POApprovalsDelegationOfAuthorityDirectMaterialConfiguration());
+            builder.ApplyConfiguration(new POApprovalsDelegationOfAuthorityIndirectExpenseConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalChainConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalStageConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalOutboxConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalAuditConfiguration());
+
+            builder.Entity<Usr>()
+                 .HasMany(p => p.ShareFileAccessRules)
+                 .WithOne()
+                 .HasForeignKey(p => p.UserId);
+
+            builder.Entity<SupplierShareFile>()
+                 .HasMany(p => p.AccessRules)
+                 .WithOne()
+                 .HasForeignKey(p => p.FileId);
+
+            builder.Entity<OfficeServiceAreaView>().ToView("OfficeServiceAreaView");
+            builder.Entity<OfficeServiceAreaView>().HasNoKey(); // Views are typically read-only
+
+            // builder.ApplyConfiguration(new PermissionConfiguration());
+            // builder.ApplyConfiguration(new UserRoleConfiguration());
+            // builder.ApplyConfiguration(new UserConfiguration());
+        }
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IDelegationOfAuthorityDirectMaterialReader
+    {
+        IAsyncEnumerable<DelegationOfAuthorityDirectMaterialReaderDto> ReadAsync(CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IDelegationOfAuthorityIndirectExpenseReader
+    {
+        IAsyncEnumerable<DelegationOfAuthorityIndirectExpenseReaderDto> ReadAsync(CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IFetchWaitingApprovalJob
+    {
+        Task RunAsync(CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPoApprovalChainBuilder
+    {
+        Task<IReadOnlyList<(int Seq, string RoleCode)>> BuildAsync(
+            string poNumber, decimal? directAmount, decimal? indirectAmount, CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPoApprovalNotifier
+    {
+        Task NotifyStageReadyAsync(string poNumber, int sequence, string roleCode, CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPoDecisionService
+    {
+        // Called by API when user approves/denies.
+        Task DecideAsync(string poNumber, char status, string changedBy, string? note, byte[]? rowVersion, CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPrmsReader
+    {
+        IAsyncEnumerable<(SqlPoHeader Header, SqlPoLine[] Lines)>
+            ReadWaitingApprovalAsync(CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPrmsWriter
+    {
+        // Write-back to PRMS when a decision is made.
+        Task UpdatePoStatusAsync(string poNumber, char status, CancellationToken ct); // 'A' or 'D'
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IProcessApprovalOutboxJob
+    {
+        Task RunAsync(CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface ISqlWriter
+    {
+        Task UpsertAsync(IEnumerable<SqlPoHeader> headers, IEnumerable<SqlPoLine> lines, CancellationToken ct);
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed class PoApprovalChainBuilder : IPoApprovalChainBuilder
+    {
+        private readonly ILoggerService _log;
+        public PoApprovalChainBuilder(ILoggerService log) => _log = log;
+
+        public Task<IReadOnlyList<(int Seq, string RoleCode)>> BuildAsync(
+            string poNumber, decimal? directAmount, decimal? indirectAmount, CancellationToken ct)
+        {
+            var roles = new List<string>();
+
+            // Indirect rules (manager notes)
+            if (indirectAmount is decimal i)
+            {
+                if (i <= 2000m) roles.AddRange(new[] { "LPM", "GM", "SFC" });
+                else roles.AddRange(new[] { "LPM", "GM", "SFC", "VP" });
+            }
+
+            // Direct rules
+            if (directAmount is decimal d)
+            {
+                if (d > 100_000m) roles.AddRange(new[] { "LPM", "SFC", "GM" });
+                else if (d > 50_000m) roles.Add("LPM");
+            }
+
+            // Stable de-duplication in order of appearance
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var ordered = roles.Where(r => seen.Add(r)).ToList();
+
+            var result = ordered.Select((r, idx) => (idx + 1, r)).ToList().AsReadOnly();
+            _log.Info($"ApprovalChainBuilder: PO {poNumber} -> {result.Count} stage(s).");
+            return Task.FromResult<IReadOnlyList<(int, string)>>(result);
+        }
+    }
+}
+
+using ITTPortal.POApprovals.Abstraction;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed class PoApprovalNotifier : IPoApprovalNotifier
+    {
+        public Task NotifyStageReadyAsync(string poNumber, int sequence, string roleCode, CancellationToken ct)
+            => Task.CompletedTask; // replace with email/queue later
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using Microsoft.Extensions.Configuration;
+using System.Data.Odbc;
+using System.Globalization;
+using System.Runtime.CompilerServices;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed partial class PrmsReader : IPrmsReader
+    {
+        private const string app = "ITTPortal.POApprovals.Infrastructure.PrmsReader";
+
+        private readonly string _connString;
+        private readonly ILoggerService _log;
+        private readonly IConfiguration _cfg;
+
+        public PrmsReader(IConfiguration cfg, ILoggerService log)
+        {
+            _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            _log = log ?? throw new ArgumentNullException(nameof(log));
+
+            var raw = cfg.GetConnectionString("PrmsOdbc")
+                ?? throw new InvalidOperationException("Missing connection string: PrmsOdbc");
+
+            _connString = new OdbcConnectionStringBuilder(raw).ConnectionString;
+
+            _log.Info($"{app} Initialized PrmsReader with ODBC connection.");
+        }
+
+        public async IAsyncEnumerable<(SqlPoHeader Header, SqlPoLine[] Lines)>
+            ReadWaitingApprovalAsync([EnumeratorCancellation] CancellationToken ct)
+        {
+            // 1) Seed: only POs awaiting approval (tune to your business logic as needed)
+            // by the D or I amount we need to go to the two DoA tables (I D) and summmarize the approval chain
+            // I need to write code to buid the apporval chain for each PO
+            const string Q_WAITING_SEED = @"
+                select distinct P3PURCH, P3DAMNT, P3IAMNT
+                from CORP400D.GPIMI701.INPUL500
+            ";
+
+            // 2) Header query (parameterized by PURCH)
+            const string Q_HEADER = @"
+                select a.PURCH, a.VNDNO, a.HOUSE, a.BUYER, b.BMNAM as BUYERNAME,
+                       v.VNAME, v.VADD1, v.VADD2, v.VADD3, v.VSTAT, v.VZIPC,
+                       a.PODMN, a.PODDY, a.PODYR
+                from CORP400D.GPIMI701.INPOL112 a
+                inner join CORP400D.GPIMI701.MSVMP100 v on a.VNDNO = v.VNDNO
+                inner join CORP400D.GPIMI701.POBMP100 b on a.BUYER = b.BMBUY
+                where a.PURCH = ?
+            ";
+
+            // 3) Lines query (with configurable short description column)
+            var shortDescCol = _cfg["Prms:ItemShortDescColumn"]; // e.g. "MDESC" or "SDESC" or blank
+            var shortDescExpr = string.IsNullOrWhiteSpace(shortDescCol)
+                ? "CAST(NULL AS VARCHAR(60))"
+                : $"p.{shortDescCol}";
+
+            var Q_LINES = $@"
+                select 
+                       a.PURCH, 
+                       a.""LINE#"" as LINE_NO, 
+                       a.HOUSE, 
+                       a.PRDNO, 
+                       p.DESCP as ItemDescription, 
+                       {shortDescExpr} as ItemShortDescription,
+                       a.QUANO, 
+                       a.ORDUM, 
+                       a.ECOST, 
+                       (a.QUANO * a.ECOST) as EstValue,
+                       a.RQ3MN, a.RQ3DY, a.RQ3YR, 
+                       a.POIGL
+                from   CORP400D.GPIMI701.INPOL300 a
+                left   join CORP400D.GPIMI701.MSPMP100 p on a.PRDNO = p.PRDNO
+                where  a.PURCH = ?
+                order  by a.""LINE#""";
+
+            _log.Info($"{app} Starting ReadWaitingApprovalAsync. Using ItemShortDescColumn='{shortDescCol ?? "<null>"}'.");
+
+            using var cn = new OdbcConnection(_connString);
+            try
+            {
+                await cn.OpenAsync(ct).ConfigureAwait(false);
+                _log.Info($"{app} Opened ODBC connection to PRMS.");
+            }
+            catch (Exception exOpen)
+            {
+                _log.Fatal($"{app} Failed to open ODBC connection to PRMS.", exception: exOpen);
+                throw;
+            }
+
+            var candidates = new List<(string Po, decimal? Dir, decimal? Ind)>(capacity: 256);
+
+            // --------- Seed read ----------
+            try
+            {
+                _log.Info($"{app} Reading waiting-approval seed from INPUL500.");
+                using var cmd = cn.CreateCommand();
+                cmd.CommandText = Q_WAITING_SEED;
+
+                using var rdr = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                int seedCount = 0;
+
+                while (await rdr.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    string? TrimStr(object? o)
+                    {
+                        if (o == null || o is DBNull) return null;
+                        var s = o.ToString()?.Trim();
+                        return string.IsNullOrWhiteSpace(s) ? null : s;
+                    }
+
+                    decimal? ToDec(object? o)
+                    {
+                        if (o == null || o is DBNull) return null;
+                        return decimal.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d : null;
+                    }
+
+                    var po = TrimStr(rdr["P3PURCH"]);
+                    if (!string.IsNullOrEmpty(po))
+                    {
+                        candidates.Add((po, ToDec(rdr["P3DAMNT"]), ToDec(rdr["P3IAMNT"])));
+                        seedCount++;
+                    }
+                }
+
+                _log.Info($"{app} Seed read complete. Candidate POs found: {seedCount}.");
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during seed read.");
+                throw;
+            }
+            catch (Exception exSeed)
+            {
+                _log.Error($"{app} Error while reading seed from INPUL500.", exception: exSeed);
+                throw;
+            }
+
+            // --------- Read header and lines for each PO ----------
+            foreach (var c in candidates)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    _log.Warning($"{app} Cancellation requested before expanding next candidate PO; stopping.");
+                    ct.ThrowIfCancellationRequested();
+                }
+
+                _log.Info($"{app} Reading header and lines for PO '{c.Po}'");
+
+                // ---- Header ----
+                SqlPoHeader? header = null;
+                try
+                {
+                    using var cmdH = cn.CreateCommand();
+                    cmdH.CommandText = Q_HEADER;
+                    cmdH.Parameters.Add(new OdbcParameter("@purch", OdbcType.VarChar) { Value = c.Po });
+
+                    using var rdrH = await cmdH.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                    if (await rdrH.ReadAsync(ct).ConfigureAwait(false))
+                    {
+                        string? S(object o) => o is DBNull ? null : o?.ToString()?.Trim();
+
+                        int? I(object o)
+                        {
+                            if (o is DBNull) return null;
+                            if (int.TryParse(o.ToString(), out var v)) return v;
+                            return null;
+                        }
+
+                        DateTime? FromYmd(int? yy, int? mm, int? dd)
+                        {
+                            if (!yy.HasValue || !mm.HasValue || !dd.HasValue) return null;
+                            try
+                            {
+                                var year = (yy.Value >= 0 && yy.Value <= 69) ? 2000 + yy.Value : 1900 + yy.Value;
+                                return new DateTime(year, Math.Clamp(mm.Value, 1, 12), Math.Clamp(dd.Value, 1, 31));
+                            }
+                            catch { return null; }
+                        }
+
+                        header = new SqlPoHeader(
+                            PoNumber: S(rdrH["PURCH"]) ?? c.Po,
+                            PoDate: FromYmd(I(rdrH["PODYR"]), I(rdrH["PODMN"]), I(rdrH["PODDY"])),
+                            VendorNumber: S(rdrH["VNDNO"]) ?? string.Empty,
+                            VendorName: S(rdrH["VNAME"]),
+                            VendorAddr1: S(rdrH["VADD1"]),
+                            VendorAddr2: S(rdrH["VADD2"]),
+                            VendorAddr3: S(rdrH["VADD3"]),
+                            VendorState: S(rdrH["VSTAT"]),
+                            VendorPostalCode: S(rdrH["VZIPC"]),
+                            BuyerCode: S(rdrH["BUYER"]),
+                            BuyerName: S(rdrH["BUYERNAME"]),
+                            HouseCode: S(rdrH["HOUSE"]),
+                            DirectAmount: c.Dir,
+                            IndirectAmount: c.Ind,
+                            CreatedAtUtc: DateTime.UtcNow
+                        );
+
+                        _log.Info($"{app} Header fetched for PO '{c.Po}'.");
+                    }
+                    else
+                    {
+                        _log.Warning($"{app} Header not found for PO '{c.Po}'. Skipping.");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _log.Warning($"{app} Cancellation requested while reading header for PO '{c.Po}'.");
+                    throw;
+                }
+                catch (Exception exHdr)
+                {
+                    _log.Error($"{app} Error while reading header for PO '{c.Po}'.", exception: exHdr);
+                    throw;
+                }
+
+                if (header is null) continue;
+
+                // ---- Lines ----
+                var lines = new List<SqlPoLine>(32);
+                try
+                {
+                    using var cmdL = cn.CreateCommand();
+                    cmdL.CommandText = Q_LINES;
+                    cmdL.Parameters.Add(new OdbcParameter("@purch", OdbcType.VarChar) { Value = c.Po });
+
+                    using var rdrL = await cmdL.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                    int lineCount = 0;
+
+                    while (await rdrL.ReadAsync(ct).ConfigureAwait(false))
+                    {
+                        string? S(object o) => o is DBNull ? null : o?.ToString()?.Trim();
+
+                        int? I(object o)
+                        {
+                            if (o is DBNull) return null;
+                            if (int.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var v)) return v;
+                            return null;
+                        }
+
+                        decimal? D(object o)
+                        {
+                            if (o is DBNull) return null;
+                            if (decimal.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var v)) return v;
+                            return null;
+                        }
+
+                        DateTime? FromYmd(int? yy, int? mm, int? dd)
+                        {
+                            if (!yy.HasValue || !mm.HasValue || !dd.HasValue) return null;
+                            try
+                            {
+                                var year = (yy.Value >= 0 && yy.Value <= 69) ? 2000 + yy.Value : 1900 + yy.Value;
+                                return new DateTime(year, Math.Clamp(mm.Value, 1, 12), Math.Clamp(dd.Value, 1, 31));
+                            }
+                            catch { return null; }
+                        }
+
+                        var qty = D(rdrL["QUANO"]);
+                        var unit = D(rdrL["ECOST"]);
+                        var ext = D(rdrL["EstValue"]) ?? (qty.HasValue && unit.HasValue ? qty.Value * unit.Value : (decimal?)null);
+
+                        lines.Add(new SqlPoLine(
+                            PoNumber: c.Po,
+                            LineNumber: I(rdrL["LINE_NO"]) ?? 0,
+                            HouseCode: S(rdrL["HOUSE"]),
+                            ItemNumber: S(rdrL["PRDNO"]),
+                            ItemDescription: S(rdrL["ItemDescription"]),
+                            ItemShortDescription: S(rdrL["ItemShortDescription"]),
+                            QuantityOrdered: qty,
+                            OrderUom: S(rdrL["ORDUM"]),
+                            UnitCost: unit,
+                            ExtendedCost: ext,
+                            RequiredDate: FromYmd(I(rdrL["RQ3YR"]), I(rdrL["RQ3MN"]), I(rdrL["RQ3DY"])),
+                            GlAccount: S(rdrL["POIGL"])
+                        ));
+                        lineCount++;
+                    }
+
+                    _log.Info($"{app} Lines fetched for PO '{c.Po}': {lineCount}.");
+                }
+                catch (OperationCanceledException)
+                {
+                    _log.Warning($"{app} Cancellation requested while reading lines for PO '{c.Po}'.");
+                    throw;
+                }
+                catch (Exception exLines)
+                {
+                    _log.Error($"{app} Error while reading lines for PO '{c.Po}'.", exception: exLines);
+                    throw;
+                }
+
+                // Emit result for this PO
+                yield return (header, lines.ToArray());
+            }
+
+            _log.Info($"{app} Completed ReadWaitingApprovalAsync: all {candidates.Count} candidate POs processed.");
+        }
+    }
+}
+
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using System.Data.Odbc;
+using System.Runtime.CompilerServices;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed partial class PrmsReader :
+        IDelegationOfAuthorityDirectMaterialReader,
+        IDelegationOfAuthorityIndirectExpenseReader
+    {
+        public async IAsyncEnumerable<DelegationOfAuthorityDirectMaterialReaderDto> ReadAsync(
+            [EnumeratorCancellation] CancellationToken ct)
+        {
+            const string SQL = @"select P1AMNT, P1LEVEL from CORP400D.GPIMI701.INPDP500";
+
+            using var cn = new OdbcConnection(_connString);
+            await cn.OpenAsync(ct);
+
+            using var cmd = cn.CreateCommand();
+            cmd.CommandText = SQL;
+
+            using var rdr = await cmd.ExecuteReaderAsync(ct);
+            while (await rdr.ReadAsync(ct))
+            {
+                var amount = rdr.IsDBNull(0) ? 0m : Convert.ToDecimal(rdr.GetValue(0));
+                var level = rdr.IsDBNull(1) ? string.Empty : rdr.GetValue(1)?.ToString()?.Trim() ?? string.Empty;
+                yield return new DelegationOfAuthorityDirectMaterialReaderDto(level, amount);
+            }
+        }
+
+        async IAsyncEnumerable<DelegationOfAuthorityIndirectExpenseReaderDto> IDelegationOfAuthorityIndirectExpenseReader.ReadAsync(
+            [EnumeratorCancellation] CancellationToken ct)
+        {
+            const string SQL = @"select P2AMNT, P2LEVEL from CORP400D.GPIMI701.INPEP500";
+
+            using var cn = new OdbcConnection(_connString);
+            await cn.OpenAsync(ct);
+
+            using var cmd = cn.CreateCommand();
+            cmd.CommandText = SQL;
+
+            using var rdr = await cmd.ExecuteReaderAsync(ct);
+            while (await rdr.ReadAsync(ct))
+            {
+                var amount = rdr.IsDBNull(0) ? 0m : Convert.ToDecimal(rdr.GetValue(0));
+                var level = rdr.IsDBNull(1) ? string.Empty : rdr.GetValue(1)?.ToString()?.Trim() ?? string.Empty;
+                yield return new DelegationOfAuthorityIndirectExpenseReaderDto(level, amount);
+            }
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+using Microsoft.Extensions.Configuration;
+using System.Data.Odbc;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed class PrmsWriter : IPrmsWriter
+    {
+        private readonly string _conn;
+        private readonly ILoggerService _log;
+
+        public PrmsWriter(IConfiguration cfg, ILoggerService log)
+        {
+            _log = log;
+            var raw = cfg.GetConnectionString("PrmsOdbc") ?? throw new InvalidOperationException("Missing PrmsOdbc");
+            _conn = new OdbcConnectionStringBuilder(raw).ConnectionString;
+        }
+
+        public async Task UpdatePoStatusAsync(string poNumber, char status, CancellationToken ct)
+        {
+            const string SQL = @"UPDATE CORP400D.GPIMI701.INPUP500 
+                             SET P3STAT = ?
+                             WHERE P3PURCH = ?";
+
+            var prmsValue = status == 'A' ? "Y" : "N";
+
+            using var cn = new OdbcConnection(_conn);
+            await cn.OpenAsync(ct);
+            using var cmd = cn.CreateCommand();
+            cmd.CommandText = SQL;
+            cmd.Parameters.Add(new OdbcParameter("@p3stat", OdbcType.VarChar) { Value = prmsValue });
+            cmd.Parameters.Add(new OdbcParameter("@p3purch", OdbcType.VarChar) { Value = poNumber });
+
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            if (rows <= 0)
+                throw new InvalidOperationException($"PRMS update affected 0 rows for PO {poNumber}.");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using System.Diagnostics;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    /// <summary>
+    /// Uses EF-backed repository to bulk insert into staging, then calls dbo.PO_Merge.
+    /// </summary>
+    public sealed class SqlWriter : ISqlWriter
+    {
+        private const string app = "ITTPortal.POApprovals.Infrastructure.SqlWriter";
+
+        private readonly IPoApprovalsStagingRepository _repo;
+        private readonly ILoggerService _log;
+
+        public SqlWriter(IPoApprovalsStagingRepository repo, ILoggerService log)
+            => (_repo, _log) = (repo, log);
+
+        public async Task UpsertAsync(IEnumerable<SqlPoHeader> headers, IEnumerable<SqlPoLine> lines, CancellationToken ct)
+        {
+            // Materialize to avoid multiple enumeration and to get stable counts for logging
+            List<SqlPoHeader> headerList;
+            List<SqlPoLine> lineList;
+
+            try
+            {
+                headerList = headers?.ToList() ?? new List<SqlPoHeader>();
+                lineList = lines?.ToList() ?? new List<SqlPoLine>();
+            }
+            catch (Exception ex)
+            {
+                _log.Fatal($"{app} Failed to materialize incoming headers and lines.", exception: ex);
+                throw;
+            }
+
+            _log.Info($"{app} Upsert started. Incoming counts: Headers={headerList.Count}, Lines={lineList.Count}.");
+
+            if (ct.IsCancellationRequested)
+            {
+                _log.Warning($"{app} Cancellation requested before staging work begins.");
+                ct.ThrowIfCancellationRequested();
+            }
+
+            if (headerList.Count == 0 && lineList.Count == 0)
+            {
+                _log.Warning($"{app} No data to stage (0 headers, 0 lines). Skipping merge.");
+                return;
+            }
+
+            // Map to staging entities
+            List<PoStgHeader> stgHeaders;
+            List<PoStgLine> stgLines;
+
+            try
+            {
+                stgHeaders = headerList.Select(h => new PoStgHeader
+                {
+                    PoNumber = h.PoNumber,
+                    PoDate = h.PoDate,
+                    VendorNumber = h.VendorNumber,
+                    VendorName = h.VendorName,
+                    VendorAddr1 = h.VendorAddr1,
+                    VendorAddr2 = h.VendorAddr2,
+                    VendorAddr3 = h.VendorAddr3,
+                    VendorState = h.VendorState,
+                    VendorPostalCode = h.VendorPostalCode,
+                    BuyerCode = h.BuyerCode,
+                    BuyerName = h.BuyerName,
+                    HouseCode = h.HouseCode,
+                    DirectAmount = h.DirectAmount,
+                    IndirectAmount = h.IndirectAmount,
+                    CreatedAtUtc = h.CreatedAtUtc ?? DateTime.UtcNow
+                }).ToList();
+
+                var stagedAt = DateTime.UtcNow;
+                stgLines = lineList.Select(l => new PoStgLine
+                {
+                    PoNumber = l.PoNumber,
+                    LineNumber = l.LineNumber,
+                    HouseCode = l.HouseCode,
+                    ItemNumber = l.ItemNumber,
+                    ItemDescription = l.ItemDescription,
+                    ItemShortDescription = l.ItemShortDescription,
+                    QuantityOrdered = l.QuantityOrdered,
+                    OrderUom = l.OrderUom,
+                    UnitCost = l.UnitCost,
+                    ExtendedCost = l.ExtendedCost,
+                    RequiredDate = l.RequiredDate,
+                    GlAccount = l.GlAccount,
+                    CreatedAtUtc = stagedAt
+                }).ToList();
+
+                _log.Info($"{app} Mapped to staging entities. Headers={stgHeaders.Count}, Lines={stgLines.Count}.");
+            }
+            catch (Exception exMap)
+            {
+                _log.Error($"{app} Failed while mapping headers and lines to staging entities.", exception: exMap);
+                throw;
+            }
+
+            // Insert headers
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                if (stgHeaders.Count > 0)
+                {
+                    _log.Info($"{app} Inserting {stgHeaders.Count} header rows into dbo.PO_Stg_Header.");
+                    await _repo.InsertHeadersAsync(stgHeaders, ct);
+                    sw.Stop();
+                    _log.Info($"{app} Inserted {stgHeaders.Count} headers in {sw.ElapsedMilliseconds} ms.");
+                }
+                else
+                {
+                    _log.Warning($"{app} No header rows to insert into staging.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during header insert.");
+                throw;
+            }
+            catch (Exception exHdrInsert)
+            {
+                _log.Error($"{app} Header insert failed for {stgHeaders.Count} rows.", exception: exHdrInsert);
+                throw;
+            }
+
+            // Insert lines
+            sw.Restart();
+            try
+            {
+                if (stgLines.Count > 0)
+                {
+                    _log.Info($"{app} Inserting {stgLines.Count} line rows into dbo.PO_Stg_Line.");
+                    await _repo.InsertLinesAsync(stgLines, ct);
+                    sw.Stop();
+                    _log.Info($"{app} Inserted {stgLines.Count} lines in {sw.ElapsedMilliseconds} ms.");
+                }
+                else
+                {
+                    _log.Warning($"{app} No line rows to insert into staging.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during line insert.");
+                throw;
+            }
+            catch (Exception exLineInsert)
+            {
+                _log.Error($"{app} Line insert failed for {stgLines.Count} rows.", exception: exLineInsert);
+                throw;
+            }
+
+            if (ct.IsCancellationRequested)
+            {
+                _log.Warning($"{app} Cancellation requested before merge execution.");
+                ct.ThrowIfCancellationRequested();
+            }
+
+            // Execute merge
+            sw.Restart();
+            try
+            {
+                _log.Info($"{app} Executing stored procedure dbo.PO_Merge.");
+                await _repo.ExecuteMergeAsync(ct);
+                sw.Stop();
+                _log.Info($"{app} dbo.PO_Merge completed in {sw.ElapsedMilliseconds} ms.");
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during dbo.PO_Merge.");
+                throw;
+            }
+            catch (Exception exMerge)
+            {
+                _log.Error($"{app} stored procedure dbo.PO_Merge failed.", exception: exMerge);
+                throw;
+            }
+
+            _log.Info($"{app} Upsert finished successfully. Headers={stgHeaders.Count}, Lines={stgLines.Count}.");
+        }
+    }
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    public sealed record DelegationOfAuthorityDirectMaterialReaderDto(string Level, decimal Amount);
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    public sealed record DelegationOfAuthorityIndirectExpenseReaderDto(string Level, decimal Amount);
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    public sealed record OutboxEventRow(
+        long OutboxId,
+        string PoNumber,
+        string EventType,
+        DateTime OccurredAtUtc,
+        decimal? DirectAmount,
+        decimal? IndirectAmount
+    );
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    // SqlPoHeader.cs
+
+    // Header shaped for SQL Server (clear names & types)
+    public sealed record SqlPoHeader(
+        string PoNumber,               // nvarchar(20)
+        DateTime? PoDate,              // date
+        string VendorNumber,           // nvarchar(20)
+        string? VendorName,            // nvarchar(80)
+        string? VendorAddr1,           // nvarchar(80)
+        string? VendorAddr2,           // nvarchar(80)
+        string? VendorAddr3,           // nvarchar(80)
+        string? VendorState,           // nvarchar(20)
+        string? VendorPostalCode,      // nvarchar(20)
+        string? BuyerCode,             // nvarchar(10)
+        string? BuyerName,             // nvarchar(60)
+        string? HouseCode,             // nvarchar(10)
+        decimal? DirectAmount,         // decimal(18,2)
+        decimal? IndirectAmount,       // decimal(18,2)
+        DateTime? CreatedAtUtc         // datetime2(0)
+    );
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    // SqlPoLine.cs
+
+    // Line shaped for SQL Server (clear names & types)
+    public sealed record SqlPoLine(
+        string PoNumber,               // nvarchar(20)
+        int LineNumber,                // int
+        string? HouseCode,             // nvarchar(10)
+        string? ItemNumber,            // nvarchar(40)
+        string? ItemDescription,       // nvarchar(120)
+        string? ItemShortDescription,  // nvarchar(60)
+        decimal? QuantityOrdered,      // decimal(18,4)
+        string? OrderUom,              // nvarchar(12)
+        decimal? UnitCost,             // decimal(18,4)
+        decimal? ExtendedCost,         // decimal(18,4)
+        DateTime? RequiredDate,        // date
+        string? GlAccount              // nvarchar(40)
+    );
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.POApprovals.Abstraction;
+
+namespace ITTPortal.POApprovals.Services
+{
+    public sealed class FetchDelegationOfAuthorityJob
+    {
+        private readonly IDelegationOfAuthorityDirectMaterialReader _directReader;
+        private readonly IDelegationOfAuthorityIndirectExpenseReader _indirectReader;
+        private readonly IPoApprovalsDelegationOfAuthorityRepository _repo;
+        private readonly ILoggerService _log;
+
+        public FetchDelegationOfAuthorityJob(
+            IDelegationOfAuthorityDirectMaterialReader directReader,
+            IDelegationOfAuthorityIndirectExpenseReader indirectReader,
+            IPoApprovalsDelegationOfAuthorityRepository repo,
+            ILoggerService log)
+        {
+            _directReader = directReader;
+            _indirectReader = indirectReader;
+            _repo = repo;
+            _log = log;
+        }
+
+        public async Task RunAsync(CancellationToken ct)
+        {
+            const string app = "ITTPortal.POApprovals.Services.FetchDelegationOfAuthorityJob";
+            _log.Info($"{app} start.");
+
+            var direct = new List<SqlDelegationOfAuthorityDirectMaterial>();
+            await foreach (var row in _directReader.ReadAsync(ct))
+                direct.Add(new SqlDelegationOfAuthorityDirectMaterial { Level = row.Level, Amount = row.Amount });
+
+            var indirect = new List<SqlDelegationOfAuthorityIndirectExpense>();
+            await foreach (var row in _indirectReader.ReadAsync(ct))
+                indirect.Add(new SqlDelegationOfAuthorityIndirectExpense { Level = row.Level, Amount = row.Amount });
+
+            await _repo.ReplaceDirectMaterialAsync(direct, ct);
+            await _repo.ReplaceIndirectExpenseAsync(indirect, ct);
+
+            _log.Info($"{app} complete. DirectMaterial={direct.Count}, IndirectExpense={indirect.Count}");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using System.Diagnostics;
+
+namespace ITTPortal.POApprovals.Services
+{
+    public sealed class FetchWaitingApprovalJob : IFetchWaitingApprovalJob
+    {
+        private readonly IPrmsReader _reader;
+        private readonly ISqlWriter _writer;
+        private readonly ILoggerService _log;
+
+        public FetchWaitingApprovalJob(IPrmsReader reader, ISqlWriter writer, ILoggerService log)
+            => (_reader, _writer, _log) = (reader, writer, log);
+
+        public async Task RunAsync(CancellationToken ct)
+        {
+            const string app = "ITTPortal.POApprovals.Services.FetchWaitingApprovalJob";
+            var runId = Guid.NewGuid().ToString("N");
+            var swTotal = Stopwatch.StartNew();
+
+            _log.Info($"{app} [{runId}] Starting PRMS→SQL load (waiting-approval only).");
+
+            try
+            {
+                var headers = new List<SqlPoHeader>(256);
+                var lines = new List<SqlPoLine>(1024);
+
+                var swRead = Stopwatch.StartNew();
+                int yielded = 0;
+
+                await foreach (var (h, lns) in _reader.ReadWaitingApprovalAsync(ct))
+                {
+                    headers.Add(h);
+                    lines.AddRange(lns);
+                    yielded++;
+
+                    // lightweight sampling of first few POs for traceability
+                    if (yielded <= 5)
+                        _log.Info($"{app} [{runId}] Sample PO {yielded}: {h.PoNumber} (lines={lns.Length})");
+                }
+                swRead.Stop();
+
+                _log.Info($"{app} [{runId}] Reader complete in {swRead.ElapsedMilliseconds} ms. " +
+                          $"Counts: headers={headers.Count}, lines={lines.Count}.");
+
+                if (headers.Count == 0)
+                {
+                    _log.Info($"{app} [{runId}] No POs awaiting approval; exiting.");
+                    return;
+                }
+
+                var swWrite = Stopwatch.StartNew();
+                _log.Info($"{app} [{runId}] Upserting to staging and executing dbo.PO_Merge …");
+                await _writer.UpsertAsync(headers, lines, ct);
+                swWrite.Stop();
+
+                _log.Info($"{app} [{runId}] Upsert+merge finished in {swWrite.ElapsedMilliseconds} ms. " +
+                          $"Totals this run: headers={headers.Count}, lines={lines.Count}.");
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} [{runId}] Cancellation requested; aborting.");
+                throw; // propagate so callers respect cancellation
+            }
+            catch (Exception ex)
+            {
+                _log.Error(
+                    message: $"{app} [{runId}] FAILED. See exception details.",
+                    content: null,
+                    exception: ex
+                );
+                throw;
+            }
+
+            finally
+            {
+                swTotal.Stop();
+                _log.Info($"{app} [{runId}] Completed in {swTotal.ElapsedMilliseconds} ms.");
+            }
+        }
+
+
+        //public async Task RunAsync(CancellationToken ct)
+        //{
+        //    const string app = "ITTPortal.POApprovals.Services.FetchWaitingApprovalJob";
+        //    try
+        //    {
+        //        _log.Info(message: $"{app} Starting PRMS->SQL load (waiting-approval only).", content: null);
+
+        //        var headers = new List<SqlPoHeader>();
+        //        var lines = new List<SqlPoLine>();
+
+        //        await foreach (var (h, lns) in _reader.ReadWaitingApprovalAsync(ct))
+        //        {
+        //            headers.Add(h);
+        //            lines.AddRange(lns);
+        //        }
+
+        //        if (headers.Count == 0)
+        //        {
+        //            _log.Info(message: $"{app} No POs awaiting approval found.", content: null);
+        //            return;
+        //        }
+
+        //        _log.Info(message: $"{app} Upserting {headers.Count} headers and {lines.Count} lines to staging tables.", content: null);
+        //        await _writer.UpsertAsync(headers, lines, ct);
+        //        _log.Info(message: $" {app} Completed load. Headers={headers.Count}, Lines={lines.Count}", content: null);
+        //    }
+        //    catch (Exception e)
+        //    {
+        //        _log.Error(message: $"{app} FetchWaitingApprovalsJob failed.", content: null, exception: e);
+        //    }
+        //}
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Abstraction;
+
+
+namespace ITTPortal.POApprovals.Services
+{
+    public sealed class PoApprovalsService
+    {
+        private readonly IPoApprovalChainRepository _repo;
+        private readonly IPoApprovalAuditRepository _audit;
+        private readonly IPoApprovalNotifier _notifier;
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public PoApprovalsService(IPoApprovalChainRepository repo,
+                                  IPoApprovalAuditRepository audit,
+                                  IPoApprovalNotifier notifier,
+                                  PortalDbContext db,
+                                  ILoggerService log)
+        {
+            _repo = repo; _audit = audit; _notifier = notifier; _db = db; _log = log;
+        }
+
+        public async Task ApproveAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'A', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'A', userId, note, sequence, roleCode: null, category: null, ct);
+
+                var allApproved = await _repo.AllStagesApprovedAsync(poNumber, ct);
+                if (allApproved)
+                {
+                    await _repo.FinalizeChainAsync(poNumber, 'A', ct);
+                    await _audit.InsertAsync(poNumber, 'P', 'A', "system", "Chain finalized", null, null, null, ct);
+                }
+                else
+                {
+                    var next = await _repo.GetFirstPendingStageAsync(poNumber, ct);
+                    if (next is { } s)
+                        await _notifier.NotifyStageReadyAsync(poNumber, s.Seq, s.RoleCode, ct);
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+
+        public async Task DenyAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'D', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'D', userId, note, sequence, roleCode: null, category: null, ct);
+
+                await _repo.FinalizeChainAsync(poNumber, 'D', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'D', "system", "Chain finalized (denied)", null, null, null, ct);
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Abstraction;
+using Microsoft.EntityFrameworkCore;
+
+namespace ITTPortal.POApprovals.Services
+{
+    /// <summary>
+    /// Approve/Deny with PRMS as source of truth: if PRMS write-back fails, we bubble to UI
+    /// and DO NOT change local status. Only after PRMS succeeds do we persist locally.
+    /// </summary>
+    public sealed class PoDecisionService : IPoDecisionService
+    {
+        private readonly PortalDbContext _db;
+        private readonly IPrmsWriter _prmsWriter;
+        private readonly ILoggerService _log;
+
+        public PoDecisionService(PortalDbContext db, IPrmsWriter prmsWriter, ILoggerService log)
+            => (_db, _prmsWriter, _log) = (db, prmsWriter, log);
+
+        public async Task DecideAsync(
+            string poNumber,
+            char status,
+            string changedBy,
+            string? note,
+            byte[]? rowVersion,
+            CancellationToken ct)
+        {
+            if (string.IsNullOrWhiteSpace(poNumber))
+                throw new ArgumentException("poNumber is required.", nameof(poNumber));
+
+            var upper = char.ToUpperInvariant(status);
+            if (upper is not ('A' or 'D'))
+                throw new ArgumentOutOfRangeException(nameof(status), "Status must be 'A' or 'D'.");
+
+            // 1) Fail fast if PRMS write-back fails.
+            //    This updates CORP400D.GPIMI701.INPUP500 (P3STAT = 'Y' for A, 'N' for D).
+            await _prmsWriter.UpdatePoStatusAsync(poNumber, upper, ct); // throws on 0 rows or transport error
+
+            // 2) Only after PRMS success do we finalize locally (atomic proc + audit).
+            await _db.Database.ExecuteSqlInterpolatedAsync($@"
+                EXEC dbo.PO_Decide
+                    @PoNumber        = {poNumber},
+                    @NewStatus       = {upper.ToString()},
+                    @ChangedBy       = {changedBy},
+                    @DecisionNote    = {note},
+                    @ExpectedStatus  = {'W'},
+                    @RowVersion      = {rowVersion}
+            ", ct);
+
+            // 3) Mark PRMS sync success locally (best-effort).
+            await _db.Database.ExecuteSqlInterpolatedAsync($@"
+                UPDATE dbo.PO_Header
+                SET PrmsSyncStatus = {"Succeeded"}, PrmsSyncError = NULL
+                WHERE PoNumber = {poNumber}
+            ", ct);
+
+            _log.Info($"PO {poNumber} decision '{upper}' updated in PRMS and recorded locally.");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Abstraction;
+using System.Diagnostics;
+
+namespace ITTPortal.POApprovals.Services
+{
+    /// <summary>
+    /// Consumes PO_NEW_WAITING events, creates the approval chain, notifies first approver, marks processed.
+    /// Safe to run periodically (cron).
+    /// </summary>
+    public sealed class ProcessApprovalOutboxJob : IProcessApprovalOutboxJob
+    {
+        private const string app = "ITTPortal.POApprovals.Services.ProcessApprovalOutboxJob";
+
+        private readonly IPoApprovalOutboxRepository _outbox;
+        private readonly IPoApprovalChainRepository _chainRepo;
+        private readonly IPoApprovalChainBuilder _builder;
+        private readonly IPoApprovalAuditRepository _audit;
+        private readonly IPoApprovalNotifier _notifier;
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public ProcessApprovalOutboxJob(
+            IPoApprovalOutboxRepository outbox,
+            IPoApprovalChainRepository chainRepo,
+            IPoApprovalChainBuilder builder,
+            IPoApprovalAuditRepository audit,
+            IPoApprovalNotifier notifier,
+            PortalDbContext db,
+            ILoggerService log)
+        {
+            _outbox = outbox;
+            _chainRepo = chainRepo;
+            _builder = builder;
+            _audit = audit;
+            _notifier = notifier;
+            _db = db;
+            _log = log;
+        }
+
+        public async Task RunAsync(CancellationToken ct)
+        {
+            var runId = Guid.NewGuid().ToString("N");
+            var sw = Stopwatch.StartNew();
+            _log.Info($"{app} [{runId}] Start …");
+
+            var events = await _outbox.GetUnprocessedNewWaitingAsync(top: 50, ct);
+            if (events.Count == 0)
+            {
+                _log.Info($"{app} [{runId}] No unprocessed events.");
+                return;
+            }
+
+            foreach (var ev in events)
+            {
+                if (ct.IsCancellationRequested) ct.ThrowIfCancellationRequested();
+
+                await using var tx = await _db.Database.BeginTransactionAsync(ct);
+                try
+                {
+                    // 1) Idempotent chain create
+                    if (!await _chainRepo.ChainExistsAsync(ev.PoNumber, ct))
+                    {
+                        await _chainRepo.CreateChainAsync(ev.PoNumber, ct);
+
+                        var stages = await _builder.BuildAsync(ev.PoNumber, ev.DirectAmount, ev.IndirectAmount, ct);
+                        if (stages.Count > 0)
+                            await _chainRepo.InsertStagesAsync(ev.PoNumber, stages, ct);
+
+                        await _audit.InsertAsync(ev.PoNumber, oldStatus: ' ', newStatus: 'P', changedBy: "system",
+                                                 note: "Chain initialized", sequence: null, roleCode: null, category: null, ct);
+                    }
+
+                    // 2) Notify first pending
+                    var first = await _chainRepo.GetFirstPendingStageAsync(ev.PoNumber, ct);
+                    if (first is { } s)
+                        await _notifier.NotifyStageReadyAsync(ev.PoNumber, s.Seq, s.RoleCode, ct);
+
+                    // 3) Mark event processed
+                    await _outbox.MarkProcessedAsync(ev.OutboxId, ct);
+
+                    await tx.CommitAsync(ct);
+                    _log.Info($"{app} [{runId}] PO {ev.PoNumber}: processed outbox {ev.OutboxId}.");
+                }
+                catch (Exception ex)
+                {
+                    await tx.RollbackAsync(ct);
+                    _log.Error($"{app} [{runId}] PO {ev.PoNumber}: failed; Attempts++.", exception: ex);
+                    await _outbox.IncrementAttemptsAsync(ev.OutboxId, ct);
+                }
+            }
+
+            sw.Stop();
+            _log.Info($"{app} [{runId}] Done in {sw.ElapsedMilliseconds} ms. Events: {events.Count}.");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITT.Logger.Services;
+using ITTPortal.Infrastructure;
+using ITTPortal.Infrastructure.Repositories;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Infrastructure;
+using ITTPortal.POApprovals.Services;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using NLog;
+using NLog.Extensions.Logging;
+using NLog.Web;
+using System.Data;
+using System.Data.Odbc;
+using System.Globalization;
+
+namespace ITTPortal.POApprovals.Tests
+{
+    [TestClass]
+    public class PoApprovalsTests
+    {
+        private static string _cs = default!;
+        private static TestContext? _testContext;
+        private static IConfiguration _cfg = default!;
+        private static ILoggerService _log = default!;
+        private static string _sql = default!;
+        private static IConfiguration _dbCfg = default!;
+        private static ServiceProvider _sp = default!;
+
+        // =====================
+        // POCOs (Strongly-typed)
+        // =====================
+
+        /// <summary>
+        /// Initial approval "seed" row from INPUL500.
+        /// This row tells us which PURCH (PO) to expand into header/lines,
+        /// and carries amounts + creation timestamp to help determine approval needs.
+        /// </summary>
+        public sealed class PoApprovalCandidate
+        {
+            /// <summary>Purchase Order number (key for joins).</summary>
+            public string Purch { get; init; } = "";
+
+            /// <summary>Direct amount (P3DAMNT); compared to INPDP500 for approval level.</summary>
+            public decimal? DirectAmount { get; init; }
+
+            /// <summary>Indirect amount (P3IAMNT); compared to INPEP500 for approval level.</summary>
+            public decimal? IndirectAmount { get; init; }
+
+            /// <summary>Creation timestamp from P3CDTE (CYYMMDD) + P3CTIM (seconds since midnight).</summary>
+            public DateTime? CreatedAt { get; init; }
+        }
+
+        /// <summary>
+        /// Purchase Order header (INPOL112). Fields here are intentionally minimal;
+        /// add/rename after schema is confirmed with your SMEs (Cindy/George).
+        /// </summary>
+        public sealed class PoHeader
+        {
+            public string Purch { get; init; } = "";
+            public string? Buyer { get; init; }
+            public string? VendorNo { get; init; }
+
+            /// <summary>Total cost (commonly FOCST in many PRMS layouts).</summary>
+            public decimal? TotalCost { get; init; }
+
+            /// <summary>Approval flag (e.g., P1PAP 'Y'/'N') if present on your schema.</summary>
+            public string? ApprovalFlag { get; init; }
+        }
+
+        /// <summary>
+        /// Purchase Order line (INPOL300). Minimal draft set of fields;
+        /// expand to include due dates, sites, etc., as needed.
+        /// </summary>
+        public sealed class PoLine
+        {
+            public string Purch { get; init; } = "";
+
+            /// <summary>Line number (column named LINE# on PRMS; requires quoting in SQL).</summary>
+            public int? LineNo { get; init; }
+
+            /// <summary>Part number / item code (PRDNO).</summary>
+            public string? PartNo { get; init; }
+
+            /// <summary>Ordered quantity (QUANO).</summary>
+            public decimal? Qty { get; init; }
+
+            /// <summary>Unit cost (ECOST).</summary>
+            public decimal? UnitCost { get; init; }
+
+            /// <summary>Extended cost (EXTCOST) if present; if absent we compute Qty * UnitCost.</summary>
+            public decimal? ExtCost { get; init; }
+        }
+
+        /// <summary>
+        /// Aggregated PO container: Header + Lines + source candidate used to find it.
+        /// </summary>
+        public sealed class PurchaseOrder
+        {
+            public PoHeader Header { get; init; } = new PoHeader();
+            public List<PoLine> Lines { get; init; } = new();
+            public PoApprovalCandidate Source { get; init; } = new PoApprovalCandidate();
+        }
+
+        // =====================
+        // Test bootstrap
+        // =====================
+
+        /// <summary>
+        /// Loads the ODBC connection string from appsettings.json ("PrmsOdbc") and saves TestContext.
+        /// appsettings.json must be copied to the test output folder.
+        /// </summary>
+        [ClassInitialize]
+        public static void Init(TestContext ctx)
+        {
+            _testContext = ctx;
+
+            _cfg = new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+                .Build();
+
+            LogManager.Setup().LoadConfigurationFromFile("nlog.config");
+
+            var raw = _cfg.GetConnectionString("PrmsOdbc")
+                ?? throw new InvalidOperationException("Missing connection string: PrmsOdbc");
+
+            _cs = new OdbcConnectionStringBuilder(raw).ConnectionString;
+
+            var athens = _cfg.GetConnectionString("AthensWebAppsDevSQLServer")
+                ?? throw new InvalidOperationException("Missing connection string AthensWebAppsDevSQLServer");
+
+            _dbCfg = new ConfigurationBuilder()
+                .AddConfiguration(_cfg)
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["ConnectionStrings:DefaultConnection"] = athens
+                }).Build();
+
+            _sql = athens;
+
+            var services = new ServiceCollection();
+            services.AddSingleton(_dbCfg);
+            services.AddHttpContextAccessor();
+            services.AddLogging(b =>
+            {
+                b.ClearProviders();
+                b.AddNLog();
+
+            });
+
+            services.AddSingleton<ILoggerService, LoggerService>();
+            _sp = services.BuildServiceProvider();
+
+            _log = _sp.GetRequiredService<ILoggerService>();
+        }
+
+        // =====================
+        // Test 1: Smoke test
+        // =====================
+
+        /// <summary>
+        /// Basic connection + query "smoke test" against INPOP* + related tables.
+        /// Verifies the ODBC plumbing is OK by executing a scalar.
+        /// </summary>
+        [TestMethod]
+        public async Task Can_Open_Odbc_Connection_And_Query()
+        {
+            using var cn = new OdbcConnection(_cs);
+            await cn.OpenAsync();
+            _testContext!.WriteLine("ODBC connection opened successfully.");
+
+            using var cmd = cn.CreateCommand();
+            cmd.CommandText = """
+                                select BMNAM
+                                ,a.PURCH
+                                ,LINE#
+                                ,a.PRDNO
+                                ,a.PODMN
+                                ,a.PODDY
+                                ,a.PODYR
+                                ,quano
+                                ,ECOST
+                                ,quano*ECOST as ExtCost
+                                ,a.OREMN
+                                ,a.OREDY
+                                ,a.OREYR
+                                ,e.FOCST as TotalPurchaseOrderCost
+                                ,a.BUYER
+                                ,f.VNAME
+                                ,RRN(a) as RelativeRecordNum
+                                from CORP400D.GPIMI701.INPOP300 a
+                                inner join CORP400D.GPIMI701.MSPMP100 b on a.PRDNO = b.PRDNO
+                                inner join CORP400D.GPIMI701.POBMP100 ba on a.BUYER = ba.BMBUY
+                                inner join CORP400D.GPIMI701.INPOP100 e on a.PURCH = e.PURCH
+                                inner join CORP400D.GPIMI701.MSVMP550 f on a.VNDNO = f.VNDNO
+                                where e.P1PAP = 'N' and a.PODYR = '25'
+                              """;
+
+            var val = await cmd.ExecuteScalarAsync();
+            _testContext!.WriteLine($"Smoke query returned first scalar value: {val ?? "<null>"}");
+            Assert.IsNotNull(val);
+        }
+
+        // =========================================================
+        // Test 2: Strongly-typed end-to-end load (POCO approach)
+        // =========================================================
+
+        /// <summary>
+        /// Loads candidate POs from INPUL500, then for each:
+        /// - Loads PO Header from INPOL112
+        /// - Loads PO Lines from INPOL300
+        /// Materials data into POCOs and writes a short debug dump to test output.
+        /// </summary>
+        [TestMethod]
+        public async Task Can_Load_POs_With_Header_And_Lines_StronglyTyped()
+        {
+            var candidates = new List<PoApprovalCandidate>();
+
+            using var cn = new OdbcConnection(_cs);
+            await cn.OpenAsync();
+            _testContext!.WriteLine("ODBC connection opened successfully.");
+
+            // 1) Seed read from INPUL500 (limit rows to keep unit test snappy)
+            using (var cmd = cn.CreateCommand())
+            {
+                // NOTE:
+                //  - P3CDTE is CYYMMDD (C=century 0/1, YY year, MM month, DD day)
+                //  - P3CTIM is seconds since midnight (per your note "epoch")
+                cmd.CommandText = @"
+                    select distinct P3PURCH, P3DAMNT, P3IAMNT, P3CDTE, P3CTIM
+                    from CORP400D.GPIMI701.INPUL500
+                    fetch first 25 rows only
+                ";
+
+                using var rdr = await cmd.ExecuteReaderAsync();
+                while (await rdr.ReadAsync())
+                {
+                    var purch = GetString(rdr, "P3PURCH") ?? "";
+                    if (string.IsNullOrWhiteSpace(purch)) continue;
+
+                    var cyymmdd = GetString(rdr, "P3CDTE");
+                    var seconds = GetNullableDecimal(rdr, "P3CTIM");
+
+                    candidates.Add(new PoApprovalCandidate
+                    {
+                        Purch = purch.Trim(),
+                        DirectAmount = GetNullableDecimal(rdr, "P3DAMNT"),
+                        IndirectAmount = GetNullableDecimal(rdr, "P3IAMNT"),
+                        CreatedAt = ComposeDateTimeFromPrms(cyymmdd, seconds)
+                    });
+                }
+            }
+
+            _testContext!.WriteLine($"INPUL500 candidates loaded: {candidates.Count}");
+            if (candidates.Count == 0)
+            {
+                _testContext!.WriteLine("No candidates found; exiting test early.");
+                return; // do not fail the suite in data-scarce environments
+            }
+
+            // 2) For each candidate, fetch header + lines
+            var results = new List<PurchaseOrder>();
+
+            foreach (var c in candidates)
+            {
+                PoHeader? header = null;
+                var lines = new List<PoLine>();
+
+                // Header from INPOL112 (parameterized to avoid SQL injection and preserve plan reuse)
+                using (var cmdH = cn.CreateCommand())
+                {
+                    cmdH.CommandText = "select * from CORP400D.GPIMI701.INPOL112 where PURCH = ?";
+                    cmdH.Parameters.Add(new OdbcParameter("@purch", OdbcType.VarChar) { Value = c.Purch });
+
+                    using var rdrH = await cmdH.ExecuteReaderAsync();
+                    if (await rdrH.ReadAsync())
+                    {
+                        header = new PoHeader
+                        {
+                            Purch = GetString(rdrH, "PURCH") ?? c.Purch,
+                            Buyer = GetStringIfExists(rdrH, "BUYER"),
+                            VendorNo = GetStringIfExists(rdrH, "VNDNO"),
+                            TotalCost = GetNullableDecimalIfExists(rdrH, "FOCST"),
+                            ApprovalFlag = GetStringIfExists(rdrH, "P1PAP")
+                        };
+                    }
+                }
+
+                // Lines from INPOL300; note the quoted identifier "LINE#" due to the '#'
+                using (var cmdL = cn.CreateCommand())
+                {
+                    cmdL.CommandText = @"
+                        select *
+                        from CORP400D.GPIMI701.INPOL300
+                        where PURCH = ?
+                        order by ""LINE#""
+                    ";
+                    cmdL.Parameters.Add(new OdbcParameter("@purch", OdbcType.VarChar) { Value = c.Purch });
+
+                    using var rdrL = await cmdL.ExecuteReaderAsync();
+                    while (await rdrL.ReadAsync())
+                    {
+                        lines.Add(new PoLine
+                        {
+                            Purch = GetString(rdrL, "PURCH") ?? c.Purch,
+                            LineNo = GetNullableIntIfExists(rdrL, "LINE#"),
+                            PartNo = GetStringIfExists(rdrL, "PRDNO"),
+                            Qty = GetNullableDecimalIfExists(rdrL, "QUANO"),
+                            UnitCost = GetNullableDecimalIfExists(rdrL, "ECOST"),
+                            ExtCost = GetNullableDecimalIfExists(rdrL, "EXTCOST")
+                                     ?? MultiplyNullable(GetNullableDecimalIfExists(rdrL, "QUANO"),
+                                                         GetNullableDecimalIfExists(rdrL, "ECOST"))
+                        });
+                    }
+                }
+
+                if (header != null || lines.Count > 0)
+                {
+                    results.Add(new PurchaseOrder
+                    {
+                        Header = header ?? new PoHeader { Purch = c.Purch },
+                        Lines = lines,
+                        Source = c
+                    });
+                }
+            }
+
+            // 3) Basic sanity + debug dump to help you inspect the data
+            Assert.IsTrue(results.Count > 0, "No PO headers/lines were materialized.");
+            DumpPurchaseOrdersSummary(results, maxOrders: 5, maxLinesPerOrder: 3);
+        }
+
+        [TestMethod]
+        public async Task Can_Open_SqlServer_And_Select1()
+        {
+            await using var cn = new SqlConnection(_sql);
+            await cn.OpenAsync();
+
+            await using var cmd = cn.CreateCommand();
+            cmd.CommandText = "SELECT 1";
+
+            var result = await cmd.ExecuteScalarAsync();
+            Assert.AreEqual(1, Convert.ToInt32(result));
+        }
+
+        [TestMethod]
+        public async Task Can_Run_Job_EndToEnd_Loads_Delegation_Of_Authority_Lookup_Tables()
+        {
+            // Arrange
+            var prms = new PrmsReader(_cfg, _log);
+            var options = new DbContextOptionsBuilder<ITTPortal.Infrastructure.PortalDbContext>().Options;
+            using var db = new ITTPortal.Infrastructure.PortalDbContext(options, _dbCfg);
+
+            // Same reader instance implements both interfaces (one method is explicit)
+            IDelegationOfAuthorityDirectMaterialReader direct = prms;
+            IDelegationOfAuthorityIndirectExpenseReader indirect = prms;
+
+            var repo = new PoApprovalsDelegationOfAuthorityRepository(db, _log);
+            var job = new FetchDelegationOfAuthorityJob(direct, indirect, repo, _log);
+
+            // Act
+            await job.RunAsync(CancellationToken.None);
+
+            // Assert
+            var directCount = await ExecScalarAsync<int>("SELECT COUNT(1) FROM dbo.PO_DelegationOfAuthority_Direct_Material");
+            var indirectCount = await ExecScalarAsync<int>("SELECT COUNT(1) FROM dbo.PO_DelegationOfAuthority_Indirect_Expense");
+
+            Assert.IsTrue(directCount >= 0, "Direct DOA load did not complete.");
+            Assert.IsTrue(indirectCount >= 0, "Indirect DOA load did not complete.");
+
+            // Optional spot checks
+            var sampleDirectAmt = await ExecScalarAsync<decimal?>("SELECT TOP(1) Amount FROM dbo.PO_DelegationOfAuthority_Direct_Material");
+            var sampleIndirectLvl = await ExecScalarAsync<string?>("SELECT TOP(1) [Level] FROM dbo.PO_DelegationOfAuthority_Indirect_Expense");
+
+            // types & basic sanity
+            _ = sampleDirectAmt;   // decimal(19,4)
+            _ = sampleIndirectLvl; // nvarchar(50)
+        }
+
+
+
+        [TestMethod]
+        public async Task Can_Run_Job_EndToEnd_Inserts_Into_SQL()
+        {
+            var reader = new PrmsReader(_cfg, _log);
+            var options = new DbContextOptionsBuilder<PortalDbContext>().Options;
+            using var db = new PortalDbContext(options, _dbCfg);
+            var repo = new PoApprovalsStagingRepository(db, _log);
+            var writer = new SqlWriter(repo, _log);
+            var job = new FetchWaitingApprovalJob(reader, writer, _log);
+
+            // 1) Run the job (reader + writer + dbo.PO_Merge)
+            await job.RunAsync(CancellationToken.None);
+
+            // 2) Staging must be empty (merge proc truncates on success)
+            var stgH = await ExecScalarAsync<int>("SELECT COUNT(1) FROM dbo.PO_Stg_Header");
+            var stgL = await ExecScalarAsync<int>("SELECT COUNT(1) FROM dbo.PO_Stg_Line");
+            Assert.AreEqual(0, stgH, "dbo.PO_Stg_Header should be empty after merge.");
+            Assert.AreEqual(0, stgL, "dbo.PO_Stg_Line should be empty after merge.");
+        }
+
+        //private async Task<int> CountHeadersAsync(IEnumerable<string> poNumbers)
+        //{
+        //    var list = poNumbers.ToList();
+        //    var @in = string.Join(",", Enumerable.Range(0, list.Count).Select(i => $"@p{i}"));
+        //    var sql = $"SELECT COUNT(*) FROM dbo.PO_Header WHERE PoNumber IN ({@in});";
+        //    return await ExecScalarWithParamsAsync<int>(sql, list);
+        //}
+
+        //private async Task<int> CountLinesAsync(IEnumerable<string> poNumbers)
+        //{
+        //    var list = poNumbers.ToList();
+        //    var @in = string.Join(",", Enumerable.Range(0, list.Count).Select(i => $"@p{i}"));
+        //    var sql = $"SELECT COUNT(*) FROM dbo.PO_Line WHERE PoNumber IN ({@in});";
+        //    return await ExecScalarWithParamsAsync<int>(sql, list);
+        //}
+
+        private async Task<T> ExecScalarAsync<T>(string sql)
+        {
+            await using var cn = new SqlConnection(_sql);
+            await cn.OpenAsync();
+            await using var cmd = cn.CreateCommand();
+            cmd.CommandText = sql;
+
+            var o = await cmd.ExecuteScalarAsync();
+
+            if (o is null || o is DBNull) return default!;
+
+            var targetType = typeof(T);
+            var underlying = Nullable.GetUnderlyingType(targetType) ?? targetType;
+
+            var converted = Convert.ChangeType(o, underlying, CultureInfo.InvariantCulture);
+            return (T)converted!;
+        }
+
+
+        //private async Task<T> ExecScalarWithParamsAsync<T>(string sql, IList<string> values)
+        //{
+        //    await using var cn = new SqlConnection(_sql);
+        //    await cn.OpenAsync();
+        //    await using var cmd = cn.CreateCommand();
+        //    cmd.CommandText = sql;
+        //    for (int i = 0; i < values.Count; i++)
+        //        cmd.Parameters.AddWithValue($"@p{i}", values[i]);
+        //    var o = await cmd.ExecuteScalarAsync();
+        //    return (T)Convert.ChangeType(o, typeof(T), CultureInfo.InvariantCulture)!;
+        //}
+
+        // =====================
+        // Helpers (parsing, safe getters, dumping)
+        // =====================
+
+        /// <summary>
+        /// Compose DateTime from PRMS date/time fields.
+        /// P3CDTE is CYYMMDD (C=0 =&gt; 1900-based, C=1 =&gt; 2000-based by convention used here).
+        /// P3CTIM is seconds since midnight (0..86399). Adjust if your system defines a different epoch.
+        /// </summary>
+        private static DateTime? ComposeDateTimeFromPrms(string? cyymmdd, decimal? secondsOfDay)
+        {
+            if (string.IsNullOrWhiteSpace(cyymmdd) || cyymmdd.Trim().Length != 7) return null;
+            if (!int.TryParse(cyymmdd.Trim(), out var raw)) return null;
+
+            var c = raw / 1_000_000;              // C
+            var y = (raw / 10_000) % 100;         // YY
+            var m = (raw / 100) % 100;            // MM
+            var d = raw % 100;                    // DD
+
+            // If your PRMS uses different century semantics, adjust here.
+            var baseYear = c == 0 ? 1900 : 2000;
+            var year = baseYear + y;
+
+            try
+            {
+                var date = new DateTime(year, m, d);
+                if (secondsOfDay is null) return date;
+
+                var secs = (int)secondsOfDay.Value;
+                if (secs < 0) secs = 0;
+                if (secs > 86399) secs = 86399;
+
+                return date.AddSeconds(secs);
+            }
+            catch
+            {
+                // Invalid calendar date (e.g., bad month/day) — return null gracefully.
+                return null;
+            }
+        }
+
+        /// <summary>Safe string getter (throws if column missing, null if DbNull).</summary>
+        private static string? GetString(IDataRecord r, string name)
+        {
+            var ord = r.GetOrdinal(name);
+            if (r.IsDBNull(ord)) return null;
+            return r.GetValue(ord)?.ToString();
+        }
+
+        /// <summary>Safe string getter that first checks if a column exists.</summary>
+        private static string? GetStringIfExists(IDataRecord r, string name)
+        {
+            var ord = TryGetOrdinal(r, name);
+            if (ord < 0 || r.IsDBNull(ord)) return null;
+            return r.GetValue(ord)?.ToString();
+        }
+
+        /// <summary>Safe decimal? getter (throws if column missing).</summary>
+        private static decimal? GetNullableDecimal(IDataRecord r, string name)
+        {
+            var ord = r.GetOrdinal(name);
+            if (r.IsDBNull(ord)) return null;
+            return Convert.ToDecimal(r.GetValue(ord), CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>Safe decimal? getter that first checks if a column exists.</summary>
+        private static decimal? GetNullableDecimalIfExists(IDataRecord r, string name)
+        {
+            var ord = TryGetOrdinal(r, name);
+            if (ord < 0 || r.IsDBNull(ord)) return null;
+            return Convert.ToDecimal(r.GetValue(ord), CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>Safe int? getter that first checks if a column exists.</summary>
+        private static int? GetNullableIntIfExists(IDataRecord r, string name)
+        {
+            var ord = TryGetOrdinal(r, name);
+            if (ord < 0 || r.IsDBNull(ord)) return null;
+            return Convert.ToInt32(r.GetValue(ord), CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>
+        /// Returns the ordinal for a column name (case-insensitive); -1 if not found.
+        /// Useful to write robust tests when schemas vary slightly by environment.
+        /// </summary>
+        private static int TryGetOrdinal(IDataRecord r, string name)
+        {
+            for (int i = 0; i < r.FieldCount; i++)
+                if (string.Equals(r.GetName(i), name, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            return -1;
+        }
+
+        /// <summary>Multiplies two nullable decimals if both have a value; otherwise returns null.</summary>
+        private static decimal? MultiplyNullable(decimal? a, decimal? b)
+            => (a.HasValue && b.HasValue) ? a.Value * b.Value : (decimal?)null;
+
+        /// <summary>
+        /// Writes a concise summary of the first N purchase orders and a few lines for each
+        /// to the MSTest output (visible in Test Explorer). This is ideal for quick inspection.
+        /// </summary>
+        private static void DumpPurchaseOrdersSummary(List<PurchaseOrder> results, int maxOrders, int maxLinesPerOrder)
+        {
+            _testContext!.WriteLine($"--- Dumping up to {maxOrders} POs (with up to {maxLinesPerOrder} lines each) ---");
+            int count = 0;
+
+            foreach (var po in results)
+            {
+                if (count++ >= maxOrders) break;
+
+                var h = po.Header;
+                var s = po.Source;
+
+                _testContext!.WriteLine(
+                    $"PO {h.Purch} | Buyer={h.Buyer ?? "<null>"} | Vendor={h.VendorNo ?? "<null>"} | " +
+                    $"TotalCost={h.TotalCost?.ToString("0.00") ?? "<null>"} | Approval={h.ApprovalFlag ?? "<null>"} | " +
+                    $"Seed: Direct={s.DirectAmount?.ToString("0.00") ?? "<null>"} Indirect={s.IndirectAmount?.ToString("0.00") ?? "<null>"} " +
+                    $"CreatedAt={s.CreatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "<null>"} | Lines={po.Lines.Count}"
+                );
+
+                int lc = 0;
+                foreach (var line in po.Lines)
+                {
+                    if (lc++ >= maxLinesPerOrder) break;
+                    _testContext!.WriteLine(
+                        $"   Line {line.LineNo?.ToString() ?? "?"} | Part={line.PartNo ?? "<null>"} | " +
+                        $"Qty={line.Qty?.ToString("0.####") ?? "<null>"} | " +
+                        $"Unit={line.UnitCost?.ToString("0.####") ?? "<null>"} | " +
+                        $"Ext={line.ExtCost?.ToString("0.####") ?? "<null>"}"
+                    );
+                }
+            }
+            _testContext!.WriteLine("--- End dump ---");
+        }
+    }
+}
+
+using CalibrationManager.Services.Extensions;
+using EntityList.Services.Extensions;
+using FRCManager.Services.Extensions;
+using ITT.Captcha.Abstractions;
+using ITT.Captcha.Services;
+using ITT.DocumentManage.Services.Extensions;
+using ITT.Logger.Abstractions;
+using ITT.Logger.Services;
+using ITT.Rule.Engine.Services.Extensions;
+using ITT.ServiceNow.Services.Extentions;
+using ITT.SharePoint.Integration.Services.Extensions;
+using ITTPortal.Admin.Services.Extensions;
+using ITTPortal.BuyersPortal.Services.Extensions;
+using ITTPortal.CAPManager.Services.Extensions;
+using ITTPortal.CCA.Services.Extensions;
+using ITTPortal.CLMManager.Services.Extensions;
+using ITTPortal.Common.Abstractions;
+using ITTPortal.Common.Services;
+using ITTPortal.Common.Services.Extensions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Models;
+using ITTPortal.Core.Services;
+using ITTPortal.CronJobConfiguration.Services.Extensions;
+using ITTPortal.CronJobScheduler.Services.Extensions;
+using ITTPortal.Holiday.Services.Extensions;
+using ITTPortal.Identity.Interfaces;
+using ITTPortal.Identity.Services;
+using ITTPortal.Infrastructure;
+using ITTPortal.Infrastructure.Repositories;
+using ITTPortal.Infrastructure.SievoContext;
+using ITTPortal.Locator.Services.Extensions;
+using ITTPortal.Onboarding.Services.Extension;
+using ITTPortal.PartManager.Services.Extensions;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Infrastructure;
+using ITTPortal.POApprovals.Services;
+using ITTPortal.RMAManager.Services.Extensions;
+using ITTPortal.ShareFiles.Services.Extensions;
+using ITTPortal.SSA.Services.Extensions;
+using ITTPortal.Workday.Services.Extensions;
+using Microsoft.AspNetCore.Authentication.Negotiate;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.OpenApi.Models;
+using MyTasks.Abstractions;
+using MyTasks.Services;
+using MyTasks.Services.Extensions;
+using Newtonsoft.Json;
+using NLog.ITTPortal.Services.Extensions;
+using PPMManager.Services.Extensions;
+using ProjectPlan.Services.Extensions;
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+using System.Text;
+
+
+namespace ITTPortal.Web
+{
+    public class Startup
+    {
+
+        private protected readonly string key = "vRZG2vXfcfULw9MyCYMP45CCZ2M6ynzB";
+        public Startup(IConfiguration configuration)
+        {
+            Configuration = configuration;
+
+
+            var environment = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT", EnvironmentVariableTarget.Machine);
+
+            if (environment?.ToLower() == "prod")
+            {
+                // AES key must be 16, 24, or 32 bytes long
+                string[] regionsToDecrypt = {
+            "ServiceNowIntegration:Client_ID",
+            "ServiceNowIntegration:Client_Secret",
+            "ServiceNowIntegration:Username",
+            "ServiceNowIntegration:Password",
+            "WBAWorkdayIntegration:Refresh_Token",
+            "WBAWorkdayIntegration:Client_ID",
+            "WBAWorkdayIntegration:Client_Secret",
+            "WorkdayIntegration:Refresh_Token",
+            "WorkdayIntegration:Client_ID",
+            "WorkdayIntegration:Client_Secret",
+        };
+
+                DecryptAppSettings(Configuration, key, regionsToDecrypt);
+            }
+
+    
+
+        }
+
+        public IConfiguration Configuration { get; }
+
+        public void ConfigureServices(IServiceCollection services)
+        {
+            // PO Approvals
+            services.AddScoped<IPoApprovalChainBuilder, PoApprovalChainBuilder>();
+            services.AddScoped<IPoApprovalOutboxRepository, PoApprovalOutboxRepository>();
+            services.AddScoped<IPoApprovalChainRepository, PoApprovalChainRepository>();
+            services.AddScoped<IPoApprovalAuditRepository, PoApprovalAuditRepository>();
+            services.AddScoped<IPoApprovalNotifier, PoApprovalNotifier>();
+            services.AddScoped<IProcessApprovalOutboxJob, ProcessApprovalOutboxJob>();
+            services.AddScoped<PoApprovalsService>();
+
+            services.Configure<CookiePolicyOptions>(options =>
+            {
+                // This lambda determines whether user consent for non-essential cookies is needed for a given request.
+                options.CheckConsentNeeded = context => true;
+                options.MinimumSameSitePolicy = SameSiteMode.None;
+            });
+
+
+            ConfigureJwt(services);
+
+            services.AddDbContext<PortalDbContext>(options =>
+            {
+                options.EnableSensitiveDataLogging();
+                options.ConfigureWarnings(w => w.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+                options.UseLoggerFactory(LoggerFactory.Create(builder => builder.AddConsole()));
+            });
+
+
+            services.AddDbContext<SievoDbContext>(options =>
+            {
+                options.EnableSensitiveDataLogging();
+                options.ConfigureWarnings(w => w.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+                options.UseLoggerFactory(LoggerFactory.Create(builder => builder.AddConsole()));
+            });
+
+            try
+            { 
+                services.AddDbContext<FrcManagerDbContext>(options =>
+                {
+                    options.EnableSensitiveDataLogging();
+                    options.ConfigureWarnings(w => w.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+                    options.UseLoggerFactory(LoggerFactory.Create(builder => builder.AddConsole()));
+                });
+             }
+            catch(Exception ex)
+            {
+
+            }
+
+            try
+            {
+                services.AddDbContext<OrderManagerDbContext>(options =>
+                {
+                    options.EnableSensitiveDataLogging();
+                    options.ConfigureWarnings(w => w.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+                    options.UseLoggerFactory(LoggerFactory.Create(builder => builder.AddConsole()));
+                });
+            }
+            catch(Exception ex)
+            {
+
+            }
+
+            try
+            {
+                services.AddDbContextFactory<WorkdayManagerDbContext>(options =>
+                {
+                    options.EnableSensitiveDataLogging();
+                    options.ConfigureWarnings(w => w.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+                    options.UseLoggerFactory(LoggerFactory.Create(builder => builder.AddConsole()));
+                });
+            }
+            catch (Exception ex)
+            {
+
+            }
+
+
+            try
+            {
+                services.AddDbContextFactory<DocumentStorageDbContext>(options =>
+                {
+                    options.EnableSensitiveDataLogging();
+                    options.ConfigureWarnings(w => w.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+                    options.UseLoggerFactory(LoggerFactory.Create(builder => builder.AddConsole()));
+                });
+            }
+            catch (Exception ex)
+            {
+
+            }
+
+            services.AddAuthorization();
+
+            services.Configure<IISServerOptions>(options =>
+            {
+                options.MaxRequestBodySize = 200000000;
+            });
+
+
+            services.Configure<FormOptions>(options =>
+            {
+                // This lambda determines whether user consent for non-essential cookies is needed for a given request.
+                options.MultipartBodyLengthLimit = 200000000;
+            });
+
+            // register the repositories
+            InitializeDI(services);
+
+            services.AddMvc()
+                    .AddNewtonsoftJson(options =>
+                    {
+                        options.SerializerSettings.ReferenceLoopHandling = ReferenceLoopHandling.Ignore;
+                    });
+
+            // Windows Authentication Negatiate. Just for the handshake.
+            // The Authentication/Authorization after the first request will continue with JWToken 
+            services.AddAuthentication(NegotiateDefaults.AuthenticationScheme).AddNegotiate();
+
+            services.AddAuthorization(options =>
+            {
+                options.FallbackPolicy = options.DefaultPolicy;
+            });
+
+            services.AddHttpContextAccessor();
+            services.AddControllers();
+            services.AddSwaggerGen(c =>
+            {
+                try
+                {
+                    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
+                    {
+                        Description = @"JWT Authorization header using the Bearer scheme.
+                            Enter 'Bearer' [space] and then your token in the text input below.
+                            Example: 'Bearer 12345abcdef'",
+                        Name = "Authorization",
+                        In = ParameterLocation.Header,
+                        Type = SecuritySchemeType.ApiKey,
+                        Scheme = "Bearer"
+                    });
+
+                    c.AddSecurityRequirement(new OpenApiSecurityRequirement()
+                  {
+                    {
+                      new OpenApiSecurityScheme
+                      {
+                        Reference = new OpenApiReference
+                          {
+                            Type = ReferenceType.SecurityScheme,
+                            Id = "Bearer"
+                          },
+                          Scheme = "oauth2",
+                          Name = "Bearer",
+                          In = ParameterLocation.Header,
+
+                        },
+                        new List<string>()
+                      }
+                    });
+                }
+                catch (Exception)
+                {
+
+                }
+            });
+
+            // In production, the Angular files will be served from this directory
+            services.AddSpaStaticFiles(configuration =>
+            {
+                configuration.RootPath = "ClientApp/dist";
+            });
+        }
+
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            // Register Syncfusion License
+            Syncfusion.Licensing.SyncfusionLicenseProvider.RegisterLicense("Ngo9BigBOggjHTQxAR8/V1NNaF5cXmBCf1FpRmJGdld5fUVHYVZUTXxaS00DNHVRdkdmWXdccHRdRGFcWEJ0W0VWYEo=");
+
+            if (env.EnvironmentName == "dev" || env.EnvironmentName == "uat")
+            {
+                // run migration if new deployment contains changes
+                using (var serviceScope = app.ApplicationServices.GetRequiredService<IServiceScopeFactory>().CreateScope())
+                {
+                    var context = serviceScope.ServiceProvider.GetService<PortalDbContext>();
+                    context.Database.Migrate();
+                }
+
+                app.UseDeveloperExceptionPage();
+            }
+            else
+            {
+                app.UseExceptionHandler("/error");
+                app.UseStatusCodePagesWithReExecute("/error/{0}");
+                app.UseHsts();
+            }
+
+            app.UseHttpsRedirection();
+            app.UseStaticFiles();
+            app.UseSpaStaticFiles();
+
+            app.UseRouting();
+            app.UseSwagger();
+            app.UseSwaggerUI();
+
+            app.UseAuthentication();
+            app.UseAuthorization();
+
+            app.UseEndpoints(endpoints =>
+            {
+                endpoints.MapControllerRoute(
+                    name: "default",
+                    pattern: "{controller}/{action=Index}/{id?}");
+            });
+
+            app.UseSpa(spa =>
+            {
+                // To learn more about options for serving an Angular SPA from ASP.NET Core,
+                // see https://go.microsoft.com/fwlink/?linkid=864501
+
+                spa.Options.SourcePath = "ClientApp";
+           
+                if (env.IsDevelopment())
+                {
+                    //spa.UseAngularCliServer(npmScript: "start");
+                    spa.UseProxyToSpaDevelopmentServer("http://localhost:4200"); //4200
+                }
+            });
+        }
+
+        public void ConfigureJwt(IServiceCollection services)
+        {
+            var settings = GetJwtSettings();
+            services.AddSingleton<JwtSettings>(settings);
+
+            services.AddAuthentication(options =>
+            {
+                options.DefaultAuthenticateScheme = "JwtBearer";
+                options.DefaultChallengeScheme = "JwtBearer";
+            })
+            .AddJwtBearer("JwtBearer", options =>
+            {
+                options.TokenValidationParameters =
+                    new TokenValidationParameters
+                    {
+                        ValidateIssuerSigningKey = true,
+                        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(settings.Key)),
+                        ValidateIssuer = true,
+                        ValidIssuer = settings.Issuer,
+                        ValidateAudience = true,
+                        ValidAudience = settings.Audience,
+                        ValidateLifetime = true,
+                        ClockSkew = TimeSpan.FromMinutes(settings.MinutesToExpiration)
+                    };
+            });
+        }
+
+        public JwtSettings GetJwtSettings()
+        {
+            var settings = new JwtSettings
+            {
+                Key = Configuration["JwtToken:key"],
+                Audience = Configuration["JwtToken:audience"],
+                Issuer = Configuration["JwtToken:issuer"],
+                MinutesToExpiration = Convert.ToInt32(Configuration["JwtToken:minutestoexpiration"])
+            };
+
+            return settings;
+        }
+
+        private static void InitializeDI(IServiceCollection services)
+        {
+            services.AddTransient<IHttpContextAccessor, HttpContextAccessor>();
+            services.AddTransient<IUserResolverService, UserResolverService>();
+            services.AddTransient<IADFSService, ADFSService>();
+            services.AddTransient<INotificationService, NotificationService>();
+
+            services.AddTransient<IWindowsUserService, WindowsUserService>();
+            services.AddTransient<ICaptchaService, CaptchaService>();
+
+            services.AddTransient<IIdentityService, IdentityService>();
+            services.AddTransient<IBrowserRepository, BrowserRepository>();
+
+            services.AddSingleton<IMailService, MailService>();
+            services.AddTransient<IBrowserService, BrowserService>();
+            
+            //services.AddSingleton<ISharePointService, SharePointService>();
+
+            services.AddSingleton<ILoggerService, LoggerService>();
+            services.RegisterMyTasksModule();
+
+            // Module Registrations
+            services.RegisterAdminModule();
+            services.RegisterCommonModule();
+
+            services.RegisterHolidayModule();
+            services.RegisterOfficeModule();
+            services.RegisterVendorModule();
+            services.RegisterLogManagerModule();
+            services.RegisterRMAManagerModule();
+            services.RegisterCAPManagerModule();
+            services.RegisterCLMManagerModule();
+            services.RegisterRulesModule();
+            services.RegisterDocumentManageModule();
+            services.RegisterSharePointServiceModule();
+
+            services.RegisterCronJobSchedulerModule();
+            services.RegisterCronJobCongiModuleExtensions();
+
+            services.RegisterSSAModule();
+            services.RegisterProjectPlanModule();
+            services.RegisterPartManagerModule();
+
+            services.RegisterBuyersPortalModule();
+            services.RegisterCalibrationManagerModule();
+            services.RegisterShareFilesModule();
+
+            services.RegisterPCNModule();
+            services.RegisterOnboardingModule();
+            services.RegisterWorkdayModule();
+            services.RegisterCCAModule();
+            services.RegisterPPMModule();
+
+            services.RegisterServiceNowModule();
+
+            services.RegisterFRCModule();
+            services.RegisterEntityListModule();
+            //services.AddHostedService<TimeOffLeaveTypeWorkerService>();
+
+
+        }
+
+        private void DecryptAppSettings(IConfiguration configuration, string key, string[] regionsToDecrypt)
+        {
+            foreach (var region in regionsToDecrypt)
+            {
+                var regionValue = Configuration.GetValue<string>(region);
+                if (!string.IsNullOrEmpty(regionValue))
+                {
+                    string decryptedRegion = DecryptData(regionValue, key);
+                    configuration[region] = decryptedRegion;
+                }
+            }
+        }
+
+        private string DecryptData(string encryptedData, string key)
+        {
+            using (Aes aes = Aes.Create())
+            {
+                aes.Key = Encoding.UTF8.GetBytes(key);
+                aes.Mode = CipherMode.ECB;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (var decryptor = aes.CreateDecryptor())
+                {
+                    byte[] encryptedBytes = Convert.FromBase64String(encryptedData);
+                    byte[] decryptedBytes = decryptor.TransformFinalBlock(encryptedBytes, 0, encryptedBytes.Length);
+                    return Encoding.UTF8.GetString(decryptedBytes).TrimEnd('\0');
+                }
+            }
+        }
+    }
+}
