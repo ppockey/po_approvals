@@ -5,10 +5,32 @@ SET NOCOUNT ON;
 SET XACT_ABORT ON;
 GO
 
-
 CREATE OR ALTER PROCEDURE dbo.PO_Merge
 AS
 BEGIN
+  /* ============================================================
+     Purpose
+     -------
+     - Transactionally upsert (newest-wins) PO headers and lines
+       from staging tables into operational tables.
+     - Maintain soft-delete flags when a PO/line disappears from
+       the *current waiting* snapshot.
+     - Emit one outbox event per PO when a PO first appears as
+       waiting, or is reactivated as waiting, so a worker can
+       notify approvers by email.
+     - Always clear staging (truncate or delete) after the merge.
+     Key behavior retained:
+       * Newest-wins selection by CreatedAtUtc.
+       * Soft-deletes limited to headers having Status='W'.
+       * Outbox event type: PO_NEW_WAITING, deduped against any
+         unprocessed events.
+       * Lines included in outbox payload are a preview (TOP 3).
+     Change in this revision:
+       * Outbox emission moved AFTER the line MERGE, so payload
+         lines reflect the just-merged dbo.PO_Line state.
+       * Added lineCount/hasMore metadata to outbox payload.
+     ============================================================ */
+
   SET NOCOUNT ON;
   SET XACT_ABORT ON;
 
@@ -17,20 +39,24 @@ BEGIN
   BEGIN TRY
     BEGIN TRAN;
 
-    /* =========================================
-       Prep: capture header-merge changes (OUTPUT)
-       ========================================= */
+    /* ============================================================
+       HEADER MERGE (newest-wins)
+       ------------------------------------------------------------
+       - From staging headers, keep the most recent CreatedAtUtc
+         per PoNumber.
+       - Upsert into dbo.PO_Header by PoNumber.
+       - If a waiting header is absent from source, soft-delete it.
+       - Capture INSERT/UPDATE actions and IsActive transitions to
+         decide whether to emit an outbox event.
+       ============================================================ */
     DECLARE @HdrChanges TABLE
     (
       PoNumber     nvarchar(20),
-      Action       nvarchar(10),  -- INSERT / UPDATE
+      Action       nvarchar(10),  -- 'INSERT' / 'UPDATE'
       WasActive    bit,           -- prior IsActive (deleted)
       IsActiveNow  bit            -- new IsActive (inserted)
     );
 
-    /* =========================
-       HEADER: newest-wins source
-       ========================= */
     ;WITH H AS (
       SELECT *
       FROM (
@@ -92,89 +118,16 @@ BEGIN
     INTO @HdrChanges(PoNumber, Action, WasActive, IsActiveNow)
     ;
 
-    /* ======================================================
-       Emit outbox events for NEW or REACTIVATED waiting POs
-       with compact JSON payload for the worker
-       ====================================================== */
-    ;WITH H2 AS (
-      SELECT h.*
-      FROM @HdrChanges hc
-      JOIN dbo.PO_Header h ON h.PoNumber = hc.PoNumber
-      WHERE (hc.Action = 'INSERT' OR (hc.WasActive = 0 AND hc.IsActiveNow = 1))
-        AND h.[Status] = 'W'
-    ),
-    P AS (
-      SELECT
-        H2.PoNumber,
-        /* Build nested lines JSON (can be empty array) */
-        JSON_QUERY((
-          SELECT TOP (3)
-            l.LineNumber      AS lineNumber,
-            l.ItemNumber      AS itemNumber,
-            l.ItemDescription AS itemDescription,
-            l.ExtendedCost    AS extendedCost
-          FROM dbo.PO_Line l
-          WHERE l.PoNumber = H2.PoNumber AND l.IsActive = 1
-          ORDER BY l.LineNumber
-          FOR JSON PATH
-        )) AS LinesJson,
-        /* Build the header JSON object */
-        (SELECT
-            H2.PoNumber       AS poNumber,
-            H2.PoDate         AS poDate,
-            H2.VendorNumber   AS vendorNumber,
-            H2.VendorName     AS vendorName,
-            H2.BuyerCode      AS buyerCode,
-            H2.BuyerName      AS buyerName,
-            H2.HouseCode      AS houseCode,
-            H2.DirectAmount   AS directAmount,
-            H2.IndirectAmount AS indirectAmount,
-            (COALESCE(H2.DirectAmount,0)+COALESCE(H2.IndirectAmount,0)) AS total,
-            1                 AS schemaVersion
-         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) AS HeaderJson
-      FROM H2
-    )
-    INSERT INTO dbo.PO_ApprovalOutbox (EventType, PoNumber, OccurredAtUtc, PayloadJson)
-    SELECT
-      'PO_NEW_WAITING',
-      H2.PoNumber,
-      SYSUTCDATETIME(),
-      /* Stitch header + lines; ensure non-null payload */
-      COALESCE(
-        (
-          SELECT
-            JSON_VALUE(P.HeaderJson,'$.poNumber')         AS poNumber,
-            JSON_VALUE(P.HeaderJson,'$.poDate')           AS poDate,
-            JSON_VALUE(P.HeaderJson,'$.vendorNumber')     AS vendorNumber,
-            JSON_VALUE(P.HeaderJson,'$.vendorName')       AS vendorName,
-            JSON_VALUE(P.HeaderJson,'$.buyerCode')        AS buyerCode,
-            JSON_VALUE(P.HeaderJson,'$.buyerName')        AS buyerName,
-            JSON_VALUE(P.HeaderJson,'$.houseCode')        AS houseCode,
-            JSON_VALUE(P.HeaderJson,'$.directAmount')     AS directAmount,
-            JSON_VALUE(P.HeaderJson,'$.indirectAmount')   AS indirectAmount,
-            JSON_VALUE(P.HeaderJson,'$.total')            AS total,
-            JSON_VALUE(P.HeaderJson,'$.schemaVersion')    AS schemaVersion,
-            /* Lines as proper JSON array */
-            P.LinesJson
-          FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
-        ),
-        /* Fallback minimal payload (should rarely be used) */
-        CONCAT(
-          N'{"poNumber":"', H2.PoNumber, N'","schemaVersion":1}'
-        )
-      ) AS PayloadJson
-    FROM H2
-    JOIN P ON P.PoNumber = H2.PoNumber
-    LEFT JOIN dbo.PO_ApprovalOutbox o
-      ON o.EventType = 'PO_NEW_WAITING'
-     AND o.PoNumber = H2.PoNumber
-     AND o.ProcessedAtUtc IS NULL
-    WHERE o.OutboxId IS NULL
-    ;
-
-    /* ==========================================
-       LINES: newest-wins + resolve PoHeaderId FK
-       ========================================== */
+    /* ============================================================
+       LINE MERGE (newest-wins) + FK resolution
+       ------------------------------------------------------------
+       - From staging lines, keep the most recent CreatedAtUtc per
+         (PoNumber, LineNumber).
+       - Resolve PoHeaderId FK by joining to dbo.PO_Header.
+       - Upsert into dbo.PO_Line.
+       - If a line is absent from the current waiting snapshot, and
+         its header is currently Status='W', soft-delete the line.
+       ============================================================ */
     ;WITH L AS (
       SELECT *
       FROM (
@@ -234,9 +187,10 @@ BEGIN
         DeactivationReason = 'Line absent from PRMS waiting snapshot'
     ;
 
-    /* ----------------------------------------------
-       Cascade line soft-delete if header soft-deleted
-       ---------------------------------------------- */
+    /* ------------------------------------------------------------
+       Cascade: if a header was soft-deleted above, make all its
+       lines inactive as well (idempotent).
+       ------------------------------------------------------------ */
     UPDATE Ln
       SET IsActive            = 0,
           DeactivatedAtUtc    = COALESCE(Ln.DeactivatedAtUtc, SYSUTCDATETIME()),
@@ -247,6 +201,100 @@ BEGIN
       ON H.PoNumber = Ln.PoNumber
     WHERE H.IsActive = 0 AND Ln.IsActive = 1;
 
+    /* ============================================================
+       OUTBOX EMISSION (moved AFTER line merge)
+       ------------------------------------------------------------
+       - Emit PO_NEW_WAITING for:
+           * newly inserted waiting headers, or
+           * headers reactivated to IsActive=1,
+         and only where header Status='W'.
+       - Payload JSON:
+           * Header summary (existing fields).
+           * Lines preview: TOP (3) active lines from dbo.PO_Line
+             (now current, because we emit after the line merge).
+           * Metadata: lineCount (total active lines), hasMore (1/0).
+       - Dedup: no emit if an unprocessed PO_NEW_WAITING event for
+         the same PoNumber already exists.
+       ============================================================ */
+    ;WITH H2 AS (
+      SELECT h.*
+      FROM @HdrChanges hc
+      JOIN dbo.PO_Header h ON h.PoNumber = hc.PoNumber
+      WHERE (hc.Action = 'INSERT' OR (hc.WasActive = 0 AND hc.IsActiveNow = 1))
+        AND h.[Status] = 'W'
+    ),
+    P AS (
+      SELECT
+        H2.PoNumber,
+        /* total active lines after merge (metadata) */
+        (SELECT COUNT(*) FROM dbo.PO_Line l WHERE l.PoNumber = H2.PoNumber AND l.IsActive = 1) AS LineCount,
+        /* preview subset for email payload (TOP 3) */
+        JSON_QUERY((
+          SELECT TOP (3)
+            l.LineNumber      AS lineNumber,
+            l.ItemNumber      AS itemNumber,
+            l.ItemDescription AS itemDescription,
+            l.ExtendedCost    AS extendedCost
+          FROM dbo.PO_Line l
+          WHERE l.PoNumber = H2.PoNumber AND l.IsActive = 1
+          ORDER BY l.LineNumber
+          FOR JSON PATH
+        )) AS LinesJson,
+        /* compact header JSON object */
+        (SELECT
+            H2.PoNumber       AS poNumber,
+            H2.PoDate         AS poDate,
+            H2.VendorNumber   AS vendorNumber,
+            H2.VendorName     AS vendorName,
+            H2.BuyerCode      AS buyerCode,
+            H2.BuyerName      AS buyerName,
+            H2.HouseCode      AS houseCode,
+            H2.DirectAmount   AS directAmount,
+            H2.IndirectAmount AS indirectAmount,
+            (COALESCE(H2.DirectAmount,0)+COALESCE(H2.IndirectAmount,0)) AS total,
+            1                 AS schemaVersion
+         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) AS HeaderJson
+      FROM H2
+    )
+    INSERT INTO dbo.PO_ApprovalOutbox (EventType, PoNumber, OccurredAtUtc, PayloadJson)
+    SELECT
+      'PO_NEW_WAITING',
+      H2.PoNumber,
+      SYSUTCDATETIME(),
+      /* Stitch header + lines + metadata; ensure non-null payload */
+      COALESCE(
+        (
+          SELECT
+            JSON_VALUE(P.HeaderJson,'$.poNumber')         AS poNumber,
+            JSON_VALUE(P.HeaderJson,'$.poDate')           AS poDate,
+            JSON_VALUE(P.HeaderJson,'$.vendorNumber')     AS vendorNumber,
+            JSON_VALUE(P.HeaderJson,'$.vendorName')       AS vendorName,
+            JSON_VALUE(P.HeaderJson,'$.buyerCode')        AS buyerCode,
+            JSON_VALUE(P.HeaderJson,'$.buyerName')        AS buyerName,
+            JSON_VALUE(P.HeaderJson,'$.houseCode')        AS houseCode,
+            JSON_VALUE(P.HeaderJson,'$.directAmount')     AS directAmount,
+            JSON_VALUE(P.HeaderJson,'$.indirectAmount')   AS indirectAmount,
+            JSON_VALUE(P.HeaderJson,'$.total')            AS total,
+            JSON_VALUE(P.HeaderJson,'$.schemaVersion')    AS schemaVersion,
+            /* preview lines (TOP 3) */
+            P.LinesJson,
+            /* metadata for mailer: total lines & whether preview is partial */
+            P.LineCount                                   AS lineCount,
+            CASE WHEN P.LineCount > 3 THEN 1 ELSE 0 END   AS hasMore
+          FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+        ),
+        /* Fallback minimal payload (rare) */
+        CONCAT(N'{"poNumber":"', H2.PoNumber, N'","schemaVersion":1}')
+      ) AS PayloadJson
+    FROM H2
+    JOIN P ON P.PoNumber = H2.PoNumber
+    LEFT JOIN dbo.PO_ApprovalOutbox o
+      ON o.EventType = 'PO_NEW_WAITING'
+     AND o.PoNumber = H2.PoNumber
+     AND o.ProcessedAtUtc IS NULL
+    WHERE o.OutboxId IS NULL
+    ;
+
     COMMIT;
   END TRY
   BEGIN CATCH
@@ -254,9 +302,11 @@ BEGIN
     SET @err = ERROR_MESSAGE();
   END CATCH;
 
-  /* =========================
-     Cleanup staging ALWAYS
-     ========================= */
+  /* ============================================================
+     STAGING CLEANUP (always attempt)
+     - Prefer TRUNCATE for speed; fall back to TABLOCK DELETE.
+     - If cleanup errors, append to @err and throw at the end.
+     ============================================================ */
   BEGIN TRY
     TRUNCATE TABLE dbo.PO_Stg_Line;
     TRUNCATE TABLE dbo.PO_Stg_Header;
