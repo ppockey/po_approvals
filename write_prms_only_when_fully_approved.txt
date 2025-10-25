@@ -1,0 +1,129 @@
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Abstraction;
+using Microsoft.EntityFrameworkCore;
+
+namespace ITTPortal.POApprovals.Services
+{
+    /// <summary>
+    /// Orchestrates local PO approval workflow.
+    /// - Stage Approve/Deny updates happen only in SQL Server (local).
+    /// - PRMS write-back happens ONLY when the chain is fully approved (final status 'A').
+    /// - Denies finalize locally and DO NOT write to PRMS.
+    /// - All steps are audited in dbo.PO_Approval_Audit.
+    /// </summary>
+    public sealed class PoApprovalsService
+    {
+        private readonly IPoApprovalChainRepository _repo;
+        private readonly IPoApprovalAuditRepository _audit;
+        private readonly IPoApprovalNotifier _notifier;
+        private readonly IPrmsWriter _prmsWriter;          // <-- injected for final write-back only
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public PoApprovalsService(IPoApprovalChainRepository repo,
+                                  IPoApprovalAuditRepository audit,
+                                  IPoApprovalNotifier notifier,
+                                  IPrmsWriter prmsWriter,
+                                  PortalDbContext db,
+                                  ILoggerService log)
+        {
+            _repo = repo;
+            _audit = audit;
+            _notifier = notifier;
+            _prmsWriter = prmsWriter;
+            _db = db;
+            _log = log;
+        }
+
+        /// <summary>
+        /// Approves a single stage. If this action causes the whole chain to become approved,
+        /// we finalize locally AND write-back to PRMS ('A') at the end.
+        /// </summary>
+        public async Task ApproveAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                // 1) Local stage decision + audit
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'A', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'A', userId, note, sequence, roleCode: null, category: null, ct);
+
+                // 2) If all approved, finalize locally + audit
+                var allApproved = await _repo.AllStagesApprovedAsync(poNumber, ct);
+                if (allApproved)
+                {
+                    await _repo.FinalizeChainAsync(poNumber, 'A', ct);
+                    await _audit.InsertAsync(poNumber, 'P', 'A', "system", "Chain finalized (approved)", null, null, null, ct);
+
+                    // 3) Only now, after local finalization succeeded, write back to PRMS
+                    await _prmsWriter.UpdatePoStatusAsync(poNumber, 'A', ct);
+                    _log.Info($"PO {poNumber} finalized locally (A) and written back to PRMS.");
+                }
+                else
+                {
+                    // 3) Otherwise, notify next approver (no PRMS yet)
+                    var next = await _repo.GetFirstPendingStageAsync(poNumber, ct);
+                    if (next is { } s)
+                        await _notifier.NotifyStageReadyAsync(poNumber, s.Seq, s.RoleCode, ct);
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Denies a single stage. This immediately finalizes the chain locally (D).
+        /// Per requirement, DO NOT write back to PRMS on deny.
+        /// 
+
+// NEW: needed for final PRMS write-back after full approval
+services.AddScoped<IPrmsWriter, PrmsWriter>();
+
+</summary>
+        public async Task DenyAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                // 1) Local stage decision + audit
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'D', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'D', userId, note, sequence, roleCode: null, category: null, ct);
+
+                // 2) Finalize chain locally as Denied + audit
+                await _repo.FinalizeChainAsync(poNumber, 'D', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'D', "system", "Chain finalized (denied)", null, null, null, ct);
+
+                // 3) No PRMS write-back on deny per new rule
+                _log.Info($"PO {poNumber} finalized locally (D). No PRMS write-back by design.");
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+    }
+}
+
+
+// NEW: needed for final PRMS write-back after full approval
+services.AddScoped<IPrmsWriter, PrmsWriter>();
+
+What this delivers
+
+Users click Approve/Deny → local stage updates + audit entries only.
+
+When the last pending stage is approved, the chain is finalized locally, then PRMS is updated once to “approved”.
+
+Denied chains finalize locally only (no PRMS write-back).
+
+Audit trail remains complete and unchanged (stage decisions and finalization recorded).
