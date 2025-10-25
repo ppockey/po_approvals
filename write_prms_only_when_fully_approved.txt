@@ -81,12 +81,7 @@ namespace ITTPortal.POApprovals.Services
         /// <summary>
         /// Denies a single stage. This immediately finalizes the chain locally (D).
         /// Per requirement, DO NOT write back to PRMS on deny.
-        /// 
-
-// NEW: needed for final PRMS write-back after full approval
-services.AddScoped<IPrmsWriter, PrmsWriter>();
-
-</summary>
+        /// </summary>
         public async Task DenyAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
         {
             await using var tx = await _db.Database.BeginTransactionAsync(ct);
@@ -115,15 +110,17 @@ services.AddScoped<IPrmsWriter, PrmsWriter>();
 }
 
 
+
+
+// PO Approvals
+services.AddScoped<IPoApprovalChainBuilder, PoApprovalChainBuilder>();
+services.AddScoped<IPoApprovalOutboxRepository, PoApprovalOutboxRepository>();
+services.AddScoped<IPoApprovalChainRepository, PoApprovalChainRepository>();
+services.AddScoped<IPoApprovalAuditRepository, PoApprovalAuditRepository>();
+services.AddScoped<IPoApprovalNotifier, PoApprovalNotifier>();
+services.AddScoped<IProcessApprovalOutboxJob, ProcessApprovalOutboxJob>();
+services.AddScoped<PoApprovalsService>();
+
 // NEW: needed for final PRMS write-back after full approval
 services.AddScoped<IPrmsWriter, PrmsWriter>();
 
-What this delivers
-
-Users click Approve/Deny → local stage updates + audit entries only.
-
-When the last pending stage is approved, the chain is finalized locally, then PRMS is updated once to “approved”.
-
-Denied chains finalize locally only (no PRMS write-back).
-
-Audit trail remains complete and unchanged (stage decisions and finalization recorded).
