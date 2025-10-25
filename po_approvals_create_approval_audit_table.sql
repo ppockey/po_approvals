@@ -16,6 +16,10 @@ CREATE TABLE [dbo].[PO_Approval_Audit](
 	[ChangedBy] [nvarchar](100) NOT NULL,
 	[ChangedAtUtc] [datetime2](0) NOT NULL,
 	[DecisionNote] [nvarchar](4000) NULL,
+	[Sequence]     int            NULL,         -- approval stage sequence
+	[RoleCode]     nvarchar(40)   NULL,         -- e.g., 'LPM','GM','SFC','VP'
+	[Category]     char(1)        NULL         -- optional: 'I'/'D' if you track it
+	
 PRIMARY KEY CLUSTERED 
 (
 	[AuditId] ASC
@@ -26,4 +30,6 @@ GO
 ALTER TABLE [dbo].[PO_Approval_Audit] ADD  CONSTRAINT [DF_PO_Approval_Audit_ChangedAtUtc]  DEFAULT (sysutcdatetime()) FOR [ChangedAtUtc]
 GO
 
-
+CREATE INDEX IX_PO_Approval_Audit_PO_Stage
+  ON dbo.PO_Approval_Audit(PoNumber, Sequence, RoleCode, ChangedAtUtc DESC);
+GO
