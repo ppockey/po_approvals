@@ -1,0 +1,318 @@
+database stuff
+---------------------------------------
+/* ============================================
+   PO approvals - read-only views for frontend
+   Minimal “Step 0” (no approver directory)
+   ============================================ */
+
+-- 1) List/Detail headers (Waiting + Active only)
+CREATE OR ALTER VIEW dbo.vw_PO_Header_WaitingActive
+AS
+SELECT
+  h.PoNumber,
+  h.PoDate,
+  h.VendorName,
+  h.BuyerName,
+  h.HouseCode,
+  h.DirectAmount,
+  h.IndirectAmount,
+  (ISNULL(h.DirectAmount,0)+ISNULL(h.IndirectAmount,0)) AS TotalAmount,
+  h.Status,          -- 'W','A','D' (but filtered to 'W')
+  h.IsActive,        -- 1 (filtered)
+  h.CreatedAtUtc,
+  (SELECT COUNT(*) FROM dbo.PO_Line l WHERE l.PoNumber = h.PoNumber AND l.IsActive = 1) AS ActiveLineCount
+FROM dbo.PO_Header h
+WHERE h.Status = 'W' AND h.IsActive = 1;
+GO
+
+-- 2) Active lines (for detail page)
+CREATE OR ALTER VIEW dbo.vw_PO_Line_Active
+AS
+SELECT
+  l.PoNumber,
+  l.LineNumber,
+  l.ItemDescription,
+  l.ItemShortDescription,
+  l.QuantityOrdered,
+  l.OrderUom,
+  l.UnitCost,
+  l.ExtendedCost,
+  l.RequiredDate,
+  l.GlAccount,
+  l.IsActive -- 1 (filtered)
+FROM dbo.PO_Line l
+WHERE l.IsActive = 1;
+GO
+
+-- 3) “My queue” (PENDING stages assigned to me; chain must be Pending; header Waiting+Active)
+-- NOTE: relies on s.ApproverUserId being set when the chain is created.
+CREATE OR ALTER VIEW dbo.vw_PO_My_Todo
+AS
+SELECT
+    s.PoNumber,
+    s.[Sequence],
+    s.RoleCode,
+    h.PoDate,
+    h.VendorName,
+    h.BuyerCode,
+    h.BuyerName,
+    h.HouseCode,
+    h.DirectAmount,
+    h.IndirectAmount,
+    (ISNULL(h.DirectAmount,0)+ISNULL(h.IndirectAmount,0)) AS TotalAmount,
+    h.CreatedAtUtc,
+    s.ApproverUserId, -- the person expected to act
+    (SELECT COUNT(*) FROM dbo.PO_Line l WHERE l.PoNumber = s.PoNumber AND l.IsActive = 1) AS ActiveLineCount
+FROM dbo.PO_ApprovalStage s
+JOIN dbo.PO_ApprovalChain c
+  ON c.PoNumber = s.PoNumber AND c.[Status] = 'P'
+JOIN dbo.PO_Header h
+  ON h.PoNumber = s.PoNumber AND h.[Status] = 'W' AND h.IsActive = 1
+WHERE s.[Status] = 'P';
+GO
+
+-- (Optional) App-only permissions
+-- GRANT SELECT ON dbo.vw_PO_Header_WaitingActive TO [YourAppUser];
+-- GRANT SELECT ON dbo.vw_PO_Line_Active        TO [YourAppUser];
+-- GRANT SELECT ON dbo.vw_PO_My_Todo            TO [YourAppUser];
+
+controllers
+--------------------------------
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Services; // PoApprovalsService
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.Identity.Interfaces;  // IUserResolverService (or your equivalent)
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace ITTPortal.Web.Api;
+
+[ApiController]
+[Route("api/po")]
+public class PoController : ControllerBase
+{
+    private readonly PortalDbContext _db;
+    private readonly PoApprovalsService _approvals;
+    private readonly IUserResolverService _user;
+
+    public PoController(PortalDbContext db, PoApprovalsService approvals, IUserResolverService user)
+        => (_db, _approvals, _user) = (db, approvals, user);
+
+    // GET /api/po?search=...&page=1&pageSize=20
+    [HttpGet]
+    public async Task<IActionResult> List(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        [FromQuery] string? search = null,
+        CancellationToken ct = default)
+    {
+        var q = _db.PoHeaderViews.AsNoTracking();
+
+        if (!string.IsNullOrWhiteSpace(search))
+        {
+            var s = search.Trim();
+            q = q.Where(h =>
+                h.PoNumber.Contains(s) ||
+                (h.VendorName != null && h.VendorName.Contains(s)) ||
+                (h.BuyerName  != null && h.BuyerName.Contains(s)) ||
+                (h.HouseCode  != null && h.HouseCode.Contains(s)));
+        }
+
+        var total = await q.CountAsync(ct);
+        var rows = await q
+            .OrderByDescending(h => h.CreatedAtUtc ?? DateTime.MinValue)
+            .ThenBy(h => h.PoNumber)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+
+        return Ok(new { total, page, pageSize, rows });
+    }
+
+    // GET /api/po/my?search=...&page=1&pageSize=20
+    [HttpGet("my")]
+    public async Task<IActionResult> MyQueue(
+        [FromQuery] int page = 1,
+        [FromQuery] int pageSize = 20,
+        [FromQuery] string? search = null,
+        CancellationToken ct = default)
+    {
+        var me = _user.GetUserName()?.Trim();
+        if (string.IsNullOrEmpty(me)) return Forbid();
+
+        var q = _db.PoMyTodo.AsNoTracking()
+            .Where(x => x.ApproverUserId != null && x.ApproverUserId == me);
+
+        if (!string.IsNullOrWhiteSpace(search))
+        {
+            var s = search.Trim();
+            q = q.Where(x =>
+                x.PoNumber.Contains(s) ||
+                (x.VendorName != null && x.VendorName.Contains(s)) ||
+                (x.BuyerName  != null && x.BuyerName.Contains(s)) ||
+                (x.HouseCode  != null && x.HouseCode.Contains(s)));
+        }
+
+        var total = await q.CountAsync(ct);
+        var rows = await q
+            .OrderByDescending(x => x.CreatedAtUtc ?? DateTime.MinValue)
+            .ThenBy(x => x.PoNumber)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync(ct);
+
+        return Ok(new { total, page, pageSize, rows });
+    }
+
+    // GET /api/po/{poNumber}
+    [HttpGet("{poNumber}")]
+    public async Task<IActionResult> Detail(string poNumber, CancellationToken ct)
+    {
+        var header = await _db.PoHeaderViews.AsNoTracking()
+            .SingleOrDefaultAsync(h => h.PoNumber == poNumber, ct);
+        if (header is null) return NotFound();
+
+        var lines = await _db.PoLineViews.AsNoTracking()
+            .Where(l => l.PoNumber == poNumber)
+            .OrderBy(l => l.LineNumber)
+            .ToListAsync(ct);
+
+        var stages = await _db.PoApprovalStages.AsNoTracking()
+            .Where(s => s.PoNumber == poNumber)
+            .OrderBy(s => s.Sequence)
+            .ToListAsync(ct);
+
+        var audit = await _db.PoApprovalAudits.AsNoTracking()
+            .Where(a => a.PoNumber == poNumber)
+            .OrderByDescending(a => a.ChangedAtUtc)
+            .ToListAsync(ct);
+
+        return Ok(new { header, lines, stages, audit });
+    }
+
+    public sealed class DecisionDto
+    {
+        public int Sequence { get; init; }
+        public string? Note { get; init; }
+    }
+
+    // POST /api/po/{poNumber}/approve  { sequence:int, note?:string }
+    [HttpPost("{poNumber}/approve")]
+    public async Task<IActionResult> Approve(string poNumber, [FromBody] DecisionDto body, CancellationToken ct)
+    {
+        var me = _user.GetUserName() ?? "unknown";
+        await _approvals.ApproveAsync(poNumber, body.Sequence, me, body.Note, ct);
+        return NoContent();
+    }
+
+    // POST /api/po/{poNumber}/deny  { sequence:int, note?:string }
+    [HttpPost("{poNumber}/deny")]
+    public async Task<IActionResult> Deny(string poNumber, [FromBody] DecisionDto body, CancellationToken ct)
+    {
+        var me = _user.GetUserName() ?? "unknown";
+        await _approvals.DenyAsync(poNumber, body.Sequence, me, body.Note, ct);
+        return NoContent();
+    }
+}
+
+EF
+--------------------------------------------------
+// Models mapped to read-only SQL views
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.POApprovals.ReadModels
+{
+    [Keyless]
+    [Table("vw_PO_Header_WaitingActive", Schema = "dbo")]
+    public class PoHeaderView
+    {
+        public string PoNumber { get; set; } = null!;
+        public DateTime? PoDate { get; set; }
+        public string? VendorName { get; set; }
+        public string? BuyerName { get; set; }
+        public string? HouseCode { get; set; }
+        public decimal? DirectAmount { get; set; }
+        public decimal? IndirectAmount { get; set; }
+        public decimal TotalAmount { get; set; }
+        public char Status { get; set; }        // always 'W'
+        public bool IsActive { get; set; }      // always 1
+        public DateTime? CreatedAtUtc { get; set; }
+        public int ActiveLineCount { get; set; }
+    }
+
+    [Keyless]
+    [Table("vw_PO_Line_Active", Schema = "dbo")]
+    public class PoLineView
+    {
+        public string PoNumber { get; set; } = null!;
+        public int LineNumber { get; set; }
+        public string? ItemDescription { get; set; }
+        public string? ItemShortDescription { get; set; }
+        public decimal? QuantityOrdered { get; set; }
+        public string? OrderUom { get; set; }
+        public decimal? UnitCost { get; set; }
+        public decimal? ExtendedCost { get; set; }
+        public DateTime? RequiredDate { get; set; }
+        public string? GlAccount { get; set; }
+        public bool IsActive { get; set; }      // always 1
+    }
+
+    [Keyless]
+    [Table("vw_PO_My_Todo", Schema = "dbo")]
+    public class PoMyTodoView
+    {
+        public string PoNumber { get; set; } = null!;
+        public int Sequence { get; set; }
+        public string RoleCode { get; set; } = null!;
+        public DateTime? PoDate { get; set; }
+        public string? VendorName { get; set; }
+        public string? BuyerCode { get; set; }
+        public string? BuyerName { get; set; }
+        public string? HouseCode { get; set; }
+        public decimal? DirectAmount { get; set; }
+        public decimal? IndirectAmount { get; set; }
+        public decimal TotalAmount { get; set; }
+        public DateTime? CreatedAtUtc { get; set; }
+        public string? ApproverUserId { get; set; }
+        public int ActiveLineCount { get; set; }
+    }
+}
+
+dbcontext wiring
+----------------------------------
+// DbContext wiring (add to PortalDbContext)
+using ITTPortal.POApprovals.ReadModels;
+using Microsoft.EntityFrameworkCore;
+
+public partial class PortalDbContext : DbContext
+{
+    public DbSet<PoHeaderView> PoHeaderViews => Set<PoHeaderView>();
+    public DbSet<PoLineView>   PoLineViews   => Set<PoLineView>();
+    public DbSet<PoMyTodoView> PoMyTodo      => Set<PoMyTodoView>();
+
+    protected override void OnModelCreating(ModelBuilder b)
+    {
+        base.OnModelCreating(b);
+
+        b.Entity<PoHeaderView>().HasNoKey().ToView("vw_PO_Header_WaitingActive","dbo");
+        b.Entity<PoLineView>().HasNoKey().ToView("vw_PO_Line_Active","dbo");
+        b.Entity<PoMyTodoView>().HasNoKey().ToView("vw_PO_My_Todo","dbo");
+
+        // belt & suspenders: mark read-only so EF never tries to write
+        b.Entity<PoHeaderView>().Metadata.SetIsReadOnlyBeforeSave(true);
+        b.Entity<PoHeaderView>().Metadata.SetIsReadOnlyAfterSave(true);
+        b.Entity<PoLineView>().Metadata.SetIsReadOnlyBeforeSave(true);
+        b.Entity<PoLineView>().Metadata.SetIsReadOnlyAfterSave(true);
+        b.Entity<PoMyTodoView>().Metadata.SetIsReadOnlyBeforeSave(true);
+        b.Entity<PoMyTodoView>().Metadata.SetIsReadOnlyAfterSave(true);
+    }
+}
+
+still to-do
+-------------------------------------
+When creating the approval chain, populate PO_ApprovalStage.ApproverUserId (for now) so /api/po/my and vw_PO_My_Todo can filter correctly.
+
+Your existing approval tables/SPs remain the source of truth; these views are read-only shells for the UI.
+
+If/when you’re ready for a data-driven directory, we can swap vw_PO_My_Todo to use PO_ApproverDirectory without changing your controller.
