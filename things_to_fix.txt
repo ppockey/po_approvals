@@ -1,0 +1,341 @@
+notes:
+
+add index
+
+CREATE INDEX IX_PO_ApprovalStage_Po_Status_Seq
+ON dbo.PO_ApprovalStage (PoNumber, Status, Sequence);
+
+CREATE INDEX IX_PO_Approval_Audit_PO_Stage
+ON dbo.PO_Approval_Audit (PoNumber, Sequence, RoleCode, ChangedAtUtc);
+
+CREATE UNIQUE INDEX UX_PO_ApprovalOutbox_Unprocessed
+ON dbo.PO_ApprovalOutbox (EventType, PoNumber)
+WHERE ProcessedAtUtc IS NULL;
+
+CREATE INDEX IX_PO_ApprovalOutbox_Queued
+ON dbo.PO_ApprovalOutbox (ProcessedAtUtc, Attempts);
+
+# optional
+ALTER TABLE dbo.PO_Header ADD CONSTRAINT UQ_PO_Header_PoNumber UNIQUE (PoNumber);
+CREATE UNIQUE INDEX UX_PO_Line_Po_LineNumber ON dbo.PO_Line (PoNumber, LineNumber);
+
+CREATE INDEX IX_PO_Line_PoHeaderId ON dbo.PO_Line (PoHeaderId);
+
+
+---------------------------
+
+dbo.PO_ApproverDirectory
+Table exists in SQL.
+It is not used by any current code path (no repository/queries shown).
+If you intend to route stages to actual users, wire this into the chain-build/assignment logic (e.g., resolve RoleCode + HouseCode + BuyerCode → ApproverUserId).
+
+-----------------------------
+
+PoApprovalsService with chain guard
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Abstraction;
+using Microsoft.EntityFrameworkCore;
+
+namespace ITTPortal.POApprovals.Services
+{
+    /// <summary>
+    /// Thrown when an approval action is attempted on a PO whose approval chain
+    /// is not in a Pending ('P') state (e.g., already finalized as 'A' or 'D').
+    /// Intended to be mapped to HTTP 409 by the API layer.
+    /// </summary>
+    public sealed class ChainNotPendingException : Exception
+    {
+        public string PoNumber { get; }
+        public char CurrentStatus { get; }
+
+        public ChainNotPendingException(string poNumber, char currentStatus)
+            : base($"Approval chain is not pending for PO '{poNumber}' (current status '{currentStatus}').")
+        {
+            PoNumber = poNumber;
+            CurrentStatus = currentStatus;
+        }
+    }
+
+    /// <summary>
+    /// Orchestrates local PO approval workflow.
+    /// - Stage Approve/Deny updates happen only in SQL Server (local).
+    /// - PRMS write-back happens ONLY when the chain is fully approved (final status 'A').
+    /// - Denies finalize locally and DO NOT write to PRMS.
+    /// - All steps are audited in dbo.PO_Approval_Audit.
+    /// - Guard: prevents actions after a chain is finalized (Status != 'P') by throwing ChainNotPendingException.
+    /// </summary>
+    public sealed class PoApprovalsService
+    {
+        private readonly IPoApprovalChainRepository _repo;
+        private readonly IPoApprovalAuditRepository _audit;
+        private readonly IPoApprovalNotifier _notifier;
+        private readonly IPrmsWriter _prmsWriter;
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public PoApprovalsService(IPoApprovalChainRepository repo,
+                                  IPoApprovalAuditRepository audit,
+                                  IPoApprovalNotifier notifier,
+                                  IPrmsWriter prmsWriter,
+                                  PortalDbContext db,
+                                  ILoggerService log)
+        {
+            _repo = repo ?? throw new ArgumentNullException(nameof(repo));
+            _audit = audit ?? throw new ArgumentNullException(nameof(audit));
+            _notifier = notifier ?? throw new ArgumentNullException(nameof(notifier));
+            _prmsWriter = prmsWriter ?? throw new ArgumentNullException(nameof(prmsWriter));
+            _db = db ?? throw new ArgumentNullException(nameof(db));
+            _log = log ?? throw new ArgumentNullException(nameof(log));
+        }
+
+        /// <summary>
+        /// Approves a single stage. If this action causes the whole chain to become approved,
+        /// we finalize locally AND write-back to PRMS ('A') at the end.
+        /// Throws ChainNotPendingException if the chain is not in 'P'.
+        /// </summary>
+        public async Task ApproveAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                // Guard: ensure the chain is still Pending; lock the row to avoid races.
+                _ = await LoadChainForUpdateAsync(poNumber, ct);
+
+                // 1) Local stage decision + audit
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'A', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'A', userId, note, sequence, roleCode: null, category: null, ct);
+
+                // 2) If all approved, finalize locally + audit
+                var allApproved = await _repo.AllStagesApprovedAsync(poNumber, ct);
+                if (allApproved)
+                {
+                    await _repo.FinalizeChainAsync(poNumber, 'A', ct);
+					await _db.Database.ExecuteSqlRawAsync("UPDATE dbo.PO_Header SET Status = 'A' WHERE PoNumber = {0};", poNumber);
+                    await _audit.InsertAsync(poNumber, 'P', 'A', "system", "Chain finalized (approved)", null, null, null, ct);
+
+                    // 3) Only now, after local finalization succeeded, write back to PRMS
+                    await _prmsWriter.UpdatePoStatusAsync(poNumber, 'A', ct);
+                    _log.Info($"PO {poNumber} finalized locally (A) and written back to PRMS.");
+                }
+                else
+                {
+                    // 3) Otherwise, notify next approver (no PRMS yet)
+                    var next = await _repo.GetFirstPendingStageAsync(poNumber, ct);
+                    if (next is { } s)
+                        await _notifier.NotifyStageReadyAsync(poNumber, s.Seq, s.RoleCode, ct);
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Denies a single stage. This immediately finalizes the chain locally (D).
+        /// Per requirement, DO NOT write back to PRMS on deny.
+        /// Throws ChainNotPendingException if the chain is not in 'P'.
+        /// </summary>
+        public async Task DenyAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                // Guard: ensure the chain is still Pending; lock the row to avoid races.
+                _ = await LoadChainForUpdateAsync(poNumber, ct);
+
+                // 1) Local stage decision + audit
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'D', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'D', userId, note, sequence, roleCode: null, category: null, ct);
+
+                // 2) Finalize chain locally as Denied + audit
+                await _repo.FinalizeChainAsync(poNumber, 'D', ct);
+				await _db.Database.ExecuteSqlRawAsync("UPDATE dbo.PO_Header SET Status = 'D' WHERE PoNumber = {0};", poNumber);
+                await _audit.InsertAsync(poNumber, 'P', 'D', "system", "Chain finalized (denied)", null, null, null, ct);
+
+                // 3) No PRMS write-back on deny per rule
+                _log.Info($"PO {poNumber} finalized locally (D). No PRMS write-back by design.");
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Loads the chain row with an update lock and ensures it's still pending ('P').
+        /// Throws InvalidOperationException if not found, or ChainNotPendingException if already finalized.
+        /// </summary>
+        private async Task<PoApprovalChain> LoadChainForUpdateAsync(string poNumber, CancellationToken ct)
+        {
+            // UPDLOCK + HOLDLOCK ensures a serializable-like lock on this row for the txn duration.
+            var chain = await _db.PoApprovalChains
+                .FromSqlRaw(
+                    "SELECT * FROM dbo.PO_ApprovalChain WITH (UPDLOCK, HOLDLOCK) WHERE PoNumber = {0}",
+                    poNumber)
+                .SingleOrDefaultAsync(ct);
+
+            if (chain is null)
+                throw new InvalidOperationException($"Approval chain not found for PO {poNumber}.");
+
+            if (chain.Status != 'P')
+                throw new ChainNotPendingException(poNumber, chain.Status);
+
+            return chain;
+        }
+    }
+}
+
+recommended  mapping for bubble up to user on exception - this would go in a controller api for example:
+try
+{
+    await _svc.ApproveAsync(poNumber, sequence, UserId(), note, ct);
+    return NoContent();
+}
+catch (ChainNotPendingException ex)
+{
+    return Conflict(new { message = ex.Message }); // 409
+}
+catch (InvalidOperationException ex) when (ex.Message.Contains("not found"))
+{
+    return NotFound(new { message = ex.Message }); // 404
+}
+
+-------------------------------------------
+other frontend ideas
+here’s a practical blueprint for the first UI/API cut and how to use `dbo.PO_Header.Status` cleanly.
+
+# What to show the logged-in user
+
+## A) “My approvals (Waiting)”
+
+Only POs where:
+
+* Header is **active** and **waiting**: `PO_Header.IsActive = 1 AND PO_Header.Status = 'W'`
+* The **approval chain is still pending**: `PO_ApprovalChain.Status = 'P'`
+* The user owns the **first pending stage**:
+
+  * Either directly (`PO_ApprovalStage.ApproverUserId = @UserId`)
+  * Or via role resolution from `PO_ApproverDirectory` (RoleCode + HouseCode/BuyerCode).
+
+### Core SQL (server-side paging-ready)
+
+```sql
+-- @UserId NVARCHAR(100), @Skip INT, @Take INT
+WITH FirstPending AS (
+  SELECT s.PoNumber,
+         MIN(CASE WHEN s.Status = 'P' THEN s.Sequence END) AS FirstPendingSeq
+  FROM dbo.PO_ApprovalStage s
+  GROUP BY s.PoNumber
+),
+MyStages AS (
+  SELECT s.PoNumber, s.Sequence
+  FROM dbo.PO_ApprovalStage s
+  JOIN FirstPending fp
+    ON fp.PoNumber = s.PoNumber AND fp.FirstPendingSeq = s.Sequence
+  WHERE s.Status = 'P'
+    AND (
+         s.ApproverUserId = @UserId
+         OR EXISTS (
+           SELECT 1
+           FROM dbo.PO_ApproverDirectory d
+           WHERE d.RoleCode = s.RoleCode
+             AND d.IsActive = 1
+             AND (d.HouseCode = COALESCE(NULLIF(h.HouseCode,''), 'GLOBAL') OR d.HouseCode = 'GLOBAL')
+             AND (d.BuyerCode = COALESCE(NULLIF(h.BuyerCode,''), '') OR d.BuyerCode = '')
+             AND d.UserId = @UserId
+         )
+    )
+)
+SELECT h.PoHeaderId, h.PoNumber, h.PoDate, h.VendorName, h.BuyerName, h.HouseCode,
+       h.DirectAmount, h.IndirectAmount,
+       (SELECT COUNT(*) FROM dbo.PO_Line l WHERE l.PoNumber = h.PoNumber AND l.IsActive = 1) AS ActiveLineCount
+FROM dbo.PO_Header h
+JOIN dbo.PO_ApprovalChain c ON c.PoNumber = h.PoNumber AND c.Status = 'P'
+JOIN MyStages ms            ON ms.PoNumber = h.PoNumber
+WHERE h.IsActive = 1
+  AND h.Status = 'W'
+ORDER BY h.PoDate DESC, h.PoNumber
+OFFSET @Skip ROWS FETCH NEXT @Take ROWS ONLY;
+```
+
+> This ensures the user only sees POs where **they** own the **current** actionable stage.
+
+### Lines for a selected PO
+
+```sql
+SELECT l.*
+FROM dbo.PO_Line l
+WHERE l.PoNumber = @PoNumber AND l.IsActive = 1
+ORDER BY l.LineNumber;
+```
+
+## B) “History (Decided by me)”
+
+POs the user acted on, regardless of current status:
+
+```sql
+SELECT TOP (@Take) a.PoNumber, a.NewStatus, a.ChangedAtUtc, a.DecisionNote
+FROM dbo.PO_Approval_Audit a
+WHERE a.ChangedBy = @UserId
+ORDER BY a.ChangedAtUtc DESC
+OFFSET @Skip ROWS;
+```
+
+# API shape (suggestion)
+
+* `GET /api/po-approvals/my?skip=0&take=25` → query above (A).
+* `GET /api/po-approvals/{poNumber}/lines` → lines query.
+* `GET /api/po-approvals/history?skip=0&take=50` → audit query (B).
+
+# How to use `PO_Header.Status`
+
+* Keep `'W'` while an approval is in progress and the PO should appear in “My approvals”.
+* When the chain **finalizes**:
+
+  * **Approve** → set `PO_Header.Status = 'A'` (and keep `IsActive=1`).
+  * **Deny** → set `PO_Header.Status = 'D'`.
+* Because “My approvals” filters on `Status='W'`, the PO **falls out of view immediately** after finalization.
+* The **scheduled ETL** (`PO_Merge`) may later soft-delete (`IsActive=0`) if the PO is absent from a new PRMS “waiting” snapshot—your “My approvals” already filters out inactive headers.
+
+> Implement the status update inside the same transaction in `PoApprovalsService` after `FinalizeChainAsync(...)`:
+
+```csharp
+await _db.Database.ExecuteSqlRawAsync(
+    "UPDATE dbo.PO_Header SET Status = {0} WHERE PoNumber = {1};", 'A' /* or 'D' */, poNumber);
+```
+
+# Performance/index notes
+
+You already planned these (good):
+
+* `IX_PO_ApprovalStage_Po_Status_Seq (PoNumber, Status, Sequence)`
+* `IX_PO_Approval_Audit_PO_Stage (PoNumber, Sequence, RoleCode, ChangedAtUtc)`
+* `UX_PO_ApprovalOutbox_Unprocessed (EventType, PoNumber) WHERE ProcessedAtUtc IS NULL`
+* `IX_PO_ApprovalOutbox_Queued (ProcessedAtUtc, Attempts)`
+
+Also add (helps the queries above):
+
+* `UNIQUE INDEX UX_PO_Header_PoNumber (PoNumber)`
+* `UNIQUE INDEX UX_PO_Line_Po_LineNumber (PoNumber, LineNumber)`
+* `INDEX IX_PO_Line_PoHeaderId (PoHeaderId)`
+
+# Optional simplifications (later)
+
+* **Materialize assignment**: when you build the chain, populate `ApproverUserId` by resolving `RoleCode` against `PO_ApproverDirectory`. That removes the directory join at read time.
+* **View**: create a view (e.g., `vw_PO_MyApprovals`) implementing the “My approvals” logic; your API becomes a simple select with paging.
+
+This pattern keeps the UI simple, keeps “My approvals” fast, and gives `PO_Header.Status` a clear, user-visible meaning.
