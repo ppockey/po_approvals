@@ -1,8 +1,11 @@
--- Run once
-IF TYPE_ID('dbo.PoNumberList') IS NULL
-CREATE TYPE dbo.PoNumberList AS TABLE(
-  PoNumber nvarchar(20) NOT NULL PRIMARY KEY
-);
+-- Ensure table type exists (safe to run repeatedly)
+IF TYPE_ID(N'dbo.PoNumberList') IS NULL
+BEGIN
+  EXEC(N'CREATE TYPE dbo.PoNumberList AS TABLE (
+    PoNumber nvarchar(20) NOT NULL PRIMARY KEY
+  );');
+END
+GO
 
 CREATE OR ALTER PROCEDURE dbo.PO_BuildApprovalStages
   @PoNumbers dbo.PoNumberList READONLY,
@@ -190,3 +193,4 @@ BEGIN
 
   COMMIT;
 END
+
