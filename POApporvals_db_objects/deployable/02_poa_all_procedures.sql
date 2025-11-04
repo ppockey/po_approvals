@@ -281,72 +281,65 @@ GO
 
 /*==============================================================================
   Procedure: dbo.PO_BuildApprovalStages
-  Purpose  : Build (or rebuild) approval stage rows for a set of POs.
-
+  Purpose  : Build (or rebuild) the approval stage rows for a set of POs using
+             the current DoA ladders and a small policy table of “gate” values.
+ 
   Inputs
   ------
-  @PoNumbers : dbo.PoNumberList (table type with column PoNumber nvarchar(20))
+  @PoNumbers : dbo.PoNumberList (table type; column PoNumber nvarchar(20))
                The specific PO numbers to build stages for.
   @Rebuild   : bit
                0 = merge/update stages in place (preserve prior A/D/S statuses)
                1 = delete existing stages for these POs and recompute from scratch
-
-  Policy (dynamic thresholds)
-  ---------------------------
-  Reads the single active row from dbo.PO_ApprovalPolicy to obtain:
-    - IndirectSplitAt : decimal(19,4) ex. 2000
-        The indirect "pivot" amount. If IndAmt < this, include all
-        Indirect tiers strictly below pivot and not above the amount.
-        If IndAmt ≥ this, include all Indirect tiers at/above pivot up to IndAmt.
-
-    - DirectMinAt     : decimal(19,4)
-        Minimum Direct threshold to even consider Direct approvals. ex. 50000
-        If DirAmt < DirectMinAt → no Direct stages at all.
-
-    - DirectStartAt   : decimal(19,4)
-        The first Direct tier that should appear if Direct approvals are needed
-        (ex. 100000). We include all Direct tiers from DirectStartAt up to the
-        calculated ceiling (see below). This intentionally excludes the "Buyer"
-        tier even when DirAmt ≥ DirectMinAt.
-
-  Indirect rule (cumulative)
-  -------------------------
-  - If IndAmt <  IndirectSplitAt: include tiers with Amount <  IndirectSplitAt
-                                   and Amount ≤ IndAmt (i.e., below pivot only).
-  - If IndAmt ≥ IndirectSplitAt:  include tiers with Amount ≥ IndirectSplitAt
-                                   and Amount ≤ IndAmt (i.e., pivot and up).
-
-  Direct rule (ceiling, excludes Buyer tier)
-  ------------------------------------------
-  - If DirAmt < DirectMinAt → no Direct stages.
-  - Else find the smallest Direct tier Amount ≥ DirAmt (the "ceiling").
-    If none exists (DirAmt beyond max ladder), use the max ladder Amount.
-  - Then include all Direct tiers where Amount BETWEEN DirectStartAt AND ceiling.
-    (ex. yields:
-       50k–<100k  → LPM only
-       100k–≤249,999.99 → LPM + FC
-       etc., depending on your DoA ladder.)
-
-  De-dupe (role appearing in both ladders)
-  ----------------------------------------
-  - If a RoleCode is required by both Indirect and Direct, we emit a single stage
-    with Category = NULL (meaning "applies to both"), and we order such rows
-    alongside the Indirect group.
-
-  Approver resolution order
-  -------------------------
-  For each RoleCode of a PO:
-    1) (RoleCode, HouseCode, BuyerCode) exact
-    2) (RoleCode, HouseCode, '')        buyer-agnostic within house
-    3) (RoleCode, 'GLOBAL',   '')       global default (fallback)
-
-  Guardrails, idempotency, and behavior
-  -------------------------------------
-  - Throws if no active policy row is present.
-  - Seeds missing PO_ApprovalChain rows as 'P'.
-  - When @Rebuild=0, MERGE preserves A/D/S statuses already taken on a stage.
-  - When @Rebuild=1, all stages for scope POs are re-created cleanly.
-
+ 
+  Key idea: The PO's Indirect (IndAmt) and Direct (DirAmt) amounts determine the
+  required approval stages by comparing them against the DoA ladders. Some ladder
+  tiers use ".99" ceilings (e.g., 249,999.99) — these are *penny-edge tiers* in
+  the ladder definition. we compare the PO amount to the tier thresholds and apply 
+  the rules below.
+ 
+  Policy gates (from dbo.PO_ApprovalPolicy):
+    - IndirectSplitAt (e.g., 2,000.00)
+    - DirectMinAt     (e.g., 50,000.00)
+    - DirectStartAt   (e.g., 100,000.00)
+ 
+  Indirect (I):
+    1) If IndAmt = 0 → no indirect stages.
+    2) If IndAmt < IndirectSplitAt:
+         Include every tier with Amount < IndirectSplitAt AND Amount ≤ IndAmt.
+         (Only "sub-pivot" operational roles, capped by the PO amount.)
+    3) If IndAmt ≥ IndirectSplitAt:
+         - Always include all four sub-pivot tiers (Amount < IndirectSplitAt).
+         - Also include tiers with Amount between IndirectSplitAt and IndAmt (inclusive).
+         - Single-tier promotion:
+             If IndAmt is exactly $0.01 below the next tier, include that next tier too.
+             Additionally, per business rule, when IndAmt ≥ 135,000.00 we also include
+             exactly one next tier above the amount (even if not a penny-edge).
+ 
+  Direct (D):
+    1) If DirAmt < DirectMinAt → no direct stages (Buyer tier is intentionally excluded).
+    2) If DirAmt ≥ DirectMinAt:
+         - Compute ceiling = smallest ladder Amount ≥ DirAmt
+           (or max tier if DirAmt exceeds the ladder).
+         - Include all tiers with Amount BETWEEN DirectStartAt AND ceiling (inclusive).
+           (e.g., 100k is ≤249,999.99 yields LPM + FC; ≥250k adds Plant Manager, etc.)
+         - Single-tier promotion:
+             If DirAmt is exactly $0.01 below the next tier, include that next tier too.
+ 
+  De-dupe & ordering:
+    - If a RoleCode is required by both ladders, emit it once with Category = NULL ("both").
+    - Order Indirect group first, then Direct; within each group order by tier Amount then RoleCode.
+    - Assign Sequence = 1..N in that order.
+ 
+  Container & idempotency:
+    - Seed PO_ApprovalChain with Status='P' if missing.
+    - @Rebuild=0 preserves existing A/D/S statuses; @Rebuild=1 deletes/rebuilds stages.
+ 
+    - Penny-edges (e.g., 249,999.99; 1,999,999.99; 499,999.99) are *tier* boundaries.
+      We compute inclusion using "≤ amount" up to a ceiling tier and, when the PO is
+      exactly $0.01 below the next tier, we promote a single tier to avoid off-by-one
+      misses at those boundaries. The PO amount can be anywhere between tiers; the
+      comparison + promotion rule ensures the correct set of approvers.
 ==============================================================================*/
 CREATE OR ALTER PROCEDURE dbo.PO_BuildApprovalStages
   @PoNumbers dbo.PoNumberList READONLY,
@@ -355,10 +348,10 @@ AS
 BEGIN
   SET NOCOUNT ON;
   SET XACT_ABORT ON;
-
+ 
   BEGIN TRAN;
-
-  /* 1) Load the active policy gates (must exist) */
+ 
+  /* 1) Load active policy (must exist) */
   ;WITH ActivePolicy AS (
     SELECT TOP (1)
            IndirectSplitAt,
@@ -368,74 +361,129 @@ BEGIN
     WHERE IsActive = 1
     ORDER BY EffectiveDate DESC, UpdatedAtUtc DESC
   )
-  SELECT *
-  INTO #AP
-  FROM ActivePolicy;
-
+  SELECT * INTO #AP FROM ActivePolicy;
+ 
   IF NOT EXISTS (SELECT 1 FROM #AP)
   BEGIN
     ROLLBACK;
-    THROW 52001, 'PO_BuildApprovalStages: No active row found in dbo.PO_ApprovalPolicy.', 1;
+    THROW 52001, 'PO_BuildApprovalStages: No active row in dbo.PO_ApprovalPolicy.', 1;
   END
-
-  /* 2) Ensure a chain "container" exists for each scoped PO */
+ 
+  /* 2) Ensure chain container exists */
   INSERT INTO dbo.PO_ApprovalChain (PoNumber, CreatedAtUtc, [Status], FinalizedAtUtc)
   SELECT H.PoNumber, SYSUTCDATETIME(), 'P', NULL
   FROM dbo.PO_Header H
   JOIN @PoNumbers P ON P.PoNumber = H.PoNumber
   LEFT JOIN dbo.PO_ApprovalChain C ON C.PoNumber = H.PoNumber
   WHERE C.PoNumber IS NULL;
-
-  /* 3) Optional hard rebuild of stages for these POs */
+ 
+  /* 3) Optional hard rebuild */
   IF @Rebuild = 1
   BEGIN
     DELETE S
     FROM dbo.PO_ApprovalStage S
     JOIN @PoNumbers P ON P.PoNumber = S.PoNumber;
   END
-
-  /* 4) Scratch table for computed stages prior to MERGE */
+ 
+  /* 4) Scratch */
   IF OBJECT_ID('tempdb..#Build') IS NOT NULL DROP TABLE #Build;
   CREATE TABLE #Build(
     PoNumber       nvarchar(20)  NOT NULL,
     RoleCode       nvarchar(50)  NOT NULL,
     Category       char(1)       NULL,  -- 'I','D', or NULL (both)
-    ThresholdAmt   decimal(19,4) NULL,  -- ladder Amount used for ordering within group
+    ThresholdAmt   decimal(19,4) NULL,
     ApproverUserId nvarchar(100) NULL
   );
-
-  /* 5) Scope: resolve PO attributes used in rule computation */
+ 
+  /* 5) Scope rows */
   ;WITH ScopePO AS (
     SELECT H.PoNumber,
            H.HouseCode,
-           COALESCE(NULLIF(H.BuyerCode, ''), N'') AS BuyerCode,
+           COALESCE(NULLIF(H.BuyerCode,''), N'') AS BuyerCode,
            COALESCE(H.IndirectAmount, 0) AS IndAmt,
            COALESCE(H.DirectAmount,   0) AS DirAmt
     FROM dbo.PO_Header H
     JOIN @PoNumbers P ON P.PoNumber = H.PoNumber
     WHERE H.IsActive = 1 AND H.[Status] = 'W'
   ),
-
-  /* 6) INDIRECT: apply policy pivot to include proper cumulative tiers */
-  I_Ladder AS (
+ 
+  /* =========================
+     INDIRECT (pivot + ceiling + single-tier promotion rule)
+     ========================= */
+  I_Params AS (
+    SELECT AP.IndirectSplitAt AS PivotAmt FROM #AP AP
+  ),
+  -- Base sub-pivot inclusion
+  I_Low AS (
+    SELECT S.PoNumber, D.[Level] AS RoleCode, CAST('I' AS char(1)) AS Category, D.Amount AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN I_Params IP
+    JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense D
+      ON D.Amount < IP.PivotAmt
+     AND (
+           (S.IndAmt <  IP.PivotAmt AND D.Amount <= S.IndAmt)
+        OR (S.IndAmt >= IP.PivotAmt)  -- include all four when ≥ pivot
+         )
+    WHERE S.IndAmt > 0
+  ),
+  -- Pivot..≤IndAmt inclusion when at/above pivot
+  I_Main AS (
+    SELECT S.PoNumber, D.[Level] AS RoleCode, CAST('I' AS char(1)) AS Category, D.Amount AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN I_Params IP
+    JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense D
+      ON S.IndAmt >= IP.PivotAmt
+     AND D.Amount BETWEEN IP.PivotAmt AND S.IndAmt
+  ),
+  -- Single-tier promotion (only when IndAmt ≥ 135k OR penny-edge)
+  I_Promote AS (
     SELECT S.PoNumber,
-           D.[Level]            AS RoleCode,
+           DN.[Level]           AS RoleCode,
+           CAST('I' AS char(1)) AS Category,
+           DN.Amount            AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN I_Params IP
+    OUTER APPLY (
+      SELECT MIN(Amount) AS NextAmt
+      FROM dbo.PO_DelegationOfAuthority_Indirect_Expense
+      WHERE Amount > S.IndAmt
+    ) NX
+    JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense DN
+      ON DN.Amount = NX.NextAmt
+    WHERE S.IndAmt >= IP.PivotAmt
+      AND NX.NextAmt IS NOT NULL
+      AND (
+            CONVERT(decimal(19,2), NX.NextAmt - S.IndAmt) = 0.01
+         OR S.IndAmt >= 135000.00
+          )
+  ),
+  -- *** Always include IP CFO when 2k <= IndAmt < 135k ***
+  I_CFOBoost AS (
+    SELECT S.PoNumber,
+           D.[Level]            AS RoleCode,     -- 'IP CFO' at Amount = 135000.00
            CAST('I' AS char(1)) AS Category,
            D.Amount             AS ThresholdAmt
     FROM ScopePO S
-    CROSS JOIN #AP AP
+    CROSS JOIN I_Params IP
     JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense D
-      ON (
-           /* Below pivot: include tiers strictly below pivot and ≤ IndAmt */
-           (S.IndAmt <  AP.IndirectSplitAt AND D.Amount <  AP.IndirectSplitAt AND D.Amount <= S.IndAmt)
-           /* At/above pivot: include tiers at/above pivot up to IndAmt */
-        OR (S.IndAmt >= AP.IndirectSplitAt AND D.Amount >= AP.IndirectSplitAt AND D.Amount <= S.IndAmt)
-         )
+      ON D.Amount = 135000.00
+    WHERE S.IndAmt >= IP.PivotAmt       -- ≥ 2,000
+      AND S.IndAmt < 135000.00          -- below CFO tier
   ),
-
-  /* 7) DIRECT: compute ceiling tier if Direct is in-scope (DirAmt ≥ DirectMinAt) */
+  I_Ladder AS (
+    SELECT * FROM I_Low
+    UNION ALL
+    SELECT * FROM I_Main
+    UNION ALL
+    SELECT * FROM I_Promote
+    UNION ALL
+    SELECT * FROM I_CFOBoost
+  ),
+ 
+  /* =======================
+     DIRECT (cumulative + single-tier promotion rule; excludes Buyer)
+     ======================= */
   D_Ceil AS (
-    /* Find smallest tier >= DirAmt */
     SELECT S.PoNumber, MIN(D.Amount) AS CeilingAmt
     FROM ScopePO S
     CROSS JOIN #AP AP
@@ -443,24 +491,19 @@ BEGIN
       ON S.DirAmt >= AP.DirectMinAt
      AND D.Amount >= S.DirAmt
     GROUP BY S.PoNumber
-
+ 
     UNION ALL
-
-    /* If DirAmt exceeds defined ladder: use the maximum tier as ceiling */
+ 
     SELECT S.PoNumber, MAX(D.Amount) AS CeilingAmt
     FROM ScopePO S
     CROSS JOIN #AP AP
     JOIN dbo.PO_DelegationOfAuthority_Direct_Material D
       ON S.DirAmt >= AP.DirectMinAt
-    WHERE NOT EXISTS (
-      SELECT 1 FROM dbo.PO_DelegationOfAuthority_Direct_Material D2
-      WHERE D2.Amount >= S.DirAmt
-    )
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.PO_DelegationOfAuthority_Direct_Material D2 WHERE D2.Amount >= S.DirAmt)
     GROUP BY S.PoNumber
   ),
-
-  /* 8) DIRECT: include tiers from DirectStartAt .. ceiling (excludes Buyer tier) */
-  D_Ladder AS (
+  -- Base cumulative: DirectStartAt..Ceiling (inclusive)
+  D_Base AS (
     SELECT S.PoNumber,
            D.[Level]            AS RoleCode,
            CAST('D' AS char(1)) AS Category,
@@ -471,8 +514,42 @@ BEGIN
     JOIN dbo.PO_DelegationOfAuthority_Direct_Material D
       ON D.Amount BETWEEN AP.DirectStartAt AND C.CeilingAmt
   ),
-
-  /* 9) Combine + order within each category; compute category precedence (I before D) */
+  -- Single-tier promotion when DirAmt ≥ DirectStartAt OR penny-edge
+  D_Promote AS (
+    SELECT S.PoNumber,
+           DN.[Level]           AS RoleCode,
+           CAST('D' AS char(1)) AS Category,
+           DN.Amount            AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN #AP AP
+    OUTER APPLY (
+      SELECT MIN(Amount) AS NextAboveCeil
+      FROM dbo.PO_DelegationOfAuthority_Direct_Material
+      WHERE Amount >
+        (
+          SELECT MIN(Amount)
+          FROM dbo.PO_DelegationOfAuthority_Direct_Material
+          WHERE Amount >= S.DirAmt
+        )
+    ) NX
+    JOIN dbo.PO_DelegationOfAuthority_Direct_Material DN
+      ON DN.Amount = NX.NextAboveCeil
+    WHERE S.DirAmt >= AP.DirectMinAt
+      AND NX.NextAboveCeil IS NOT NULL
+      AND (
+            CONVERT(decimal(19,2),
+              (SELECT MIN(Amount) FROM dbo.PO_DelegationOfAuthority_Direct_Material WHERE Amount >= S.DirAmt) - S.DirAmt
+          ) = 0.01
+           OR S.DirAmt >= AP.DirectStartAt
+          )
+  ),
+  D_Ladder AS (
+    SELECT * FROM D_Base
+    UNION ALL
+    SELECT * FROM D_Promote
+  ),
+ 
+  /* ---------- Order & de-dupe ---------- */
   Ladders AS (
     SELECT PoNumber, RoleCode, Category, ThresholdAmt,
            ROW_NUMBER() OVER (PARTITION BY PoNumber, Category
@@ -484,8 +561,6 @@ BEGIN
       SELECT * FROM D_Ladder
     ) X
   ),
-
-  /* 10) De-dupe: if a RoleCode appears in both I and D, keep one (I takes precedence) */
   OrderedUnion AS (
     SELECT L.PoNumber, L.RoleCode, L.Category, L.ThresholdAmt,
            ROW_NUMBER() OVER (
@@ -494,8 +569,6 @@ BEGIN
            ) AS KeepOne
     FROM Ladders L
   ),
-
-  /* 11) Normalize category: if present in both ladders → Category = NULL ("both") */
   Kept AS (
     SELECT K.PoNumber,
            K.RoleCode,
@@ -513,9 +586,6 @@ BEGIN
     FROM OrderedUnion K
     WHERE K.KeepOne = 1
   ),
-
-  /* 12) Resolve approver identity with precedence:
-         (Role, House, Buyer) → (Role, House, '') → (Role, 'GLOBAL', '') */
   ResolvedApprover AS (
     SELECT K.PoNumber, K.RoleCode, K.Category, K.ThresholdAmt,
            COALESCE(D1.UserId, D2.UserId, D3.UserId) AS ApproverUserId
@@ -549,18 +619,13 @@ BEGIN
   INSERT INTO #Build (PoNumber, RoleCode, Category, ThresholdAmt, ApproverUserId)
   SELECT PoNumber, RoleCode, Category, ThresholdAmt, ApproverUserId
   FROM ResolvedApprover;
-
-  /* 13) Final ordering across categories:
-         - Category I first, then D
-         - Category NULL (both) grouped with I
-         - Within group: by ThresholdAmt then RoleCode
-         - Assign 1..N sequence per PO
-  */
+ 
+  /* Final ordering & MERGE */
   ;WITH SeqBase AS (
     SELECT B.*,
            CASE WHEN B.Category = 'I' THEN 1
                 WHEN B.Category = 'D' THEN 2
-                ELSE 1  -- “both” (NULL) sits with Indirect group
+                ELSE 1  -- “both” groups with Indirect
            END AS CatOrder
     FROM #Build B
   ),
@@ -572,8 +637,6 @@ BEGIN
            ) AS Seq
     FROM SeqBase
   )
-
-  /* 14) MERGE into PO_ApprovalStage */
   MERGE dbo.PO_ApprovalStage AS T
   USING Ordered AS S
     ON T.PoNumber  = S.PoNumber
@@ -593,7 +656,7 @@ BEGIN
        AND T.PoNumber IN (SELECT PoNumber FROM @PoNumbers)
   THEN
     DELETE;
-
+ 
   COMMIT;
 END
 GO
