@@ -1,0 +1,4755 @@
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalAuditRepository
+    {
+        Task InsertAsync(string poNumber, char oldStatus, char newStatus, string changedBy,
+                         string? note, int? sequence, string? roleCode, char? category,
+                         CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalChainRepository
+    {
+        Task<bool> ChainExistsAsync(string poNumber, CancellationToken ct);
+        Task CreateChainAsync(string poNumber, CancellationToken ct);
+        Task InsertStagesAsync(string poNumber, IEnumerable<(int Seq, string RoleCode)> stages, CancellationToken ct);
+
+        Task<(int Seq, string RoleCode)?> GetFirstPendingStageAsync(string poNumber, CancellationToken ct);
+        Task SetStageStatusAsync(string poNumber, int sequence, char newStatus, CancellationToken ct);
+        Task<bool> AllStagesApprovedAsync(string poNumber, CancellationToken ct);
+        Task FinalizeChainAsync(string poNumber, char finalStatus, CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalOutboxRepository
+    {
+        Task<IReadOnlyList<OutboxEventRow>> GetUnprocessedNewWaitingAsync(int top, CancellationToken ct);
+        Task MarkProcessedAsync(long outboxId, CancellationToken ct);
+        Task IncrementAttemptsAsync(long outboxId, CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalsDelegationOfAuthorityRepository
+    {
+        Task ReplaceDirectMaterialAsync(IEnumerable<Entities.POApprovals.SqlDelegationOfAuthorityDirectMaterial> rows, CancellationToken ct);
+        Task ReplaceIndirectExpenseAsync(IEnumerable<Entities.POApprovals.SqlDelegationOfAuthorityIndirectExpense> rows, CancellationToken ct);
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+
+namespace ITTPortal.Core.Abstractions
+{
+    public interface IPoApprovalsStagingRepository
+    {
+        Task InsertHeadersAsync(IEnumerable<PoStgHeader> rows, CancellationToken ct);
+
+        Task InsertLinesAsync(IEnumerable<PoStgLine> rows, CancellationToken ct);
+
+        Task TruncateStagingAsync(CancellationToken ct);
+
+        // calls dbo.PO_Merge
+        Task ExecuteMergeAsync(CancellationToken ct);
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals.Views
+{
+    [Keyless]
+    [Table("vw_PO_Header_WaitingActive", Schema = "dbo")]
+    public class PoHeaderView
+    {
+        public string PoNumber { get; set; } = null!;
+        public DateTime? PoDate { get; set; }
+        public string? VendorName { get; set; }
+        public string? BuyerName { get; set; }
+        public string? HouseCode { get; set; }
+        public decimal? DirectAmount { get; set; }
+        public decimal? IndirectAmount { get; set; }
+        public decimal TotalAmount { get; set; }
+        public char Status { get; set; }
+        public bool IsActive { get; set; }
+        public DateTime? CreatedAtUtc { get; set; }
+        public int ActiveLineCount { get; set; }
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals.Views
+{
+    [Keyless]
+    [Table("vw_PO_Line_Active", Schema = "dbo")]
+    public class PoLineView
+    {
+        public string PoNumber { get; set; } = null!;
+        public int LineNumber { get; set; }
+        public string? ItemNumber { get; set; }
+        public string? ItemDescription { get; set; }
+        public string? SpecialDescription { get; set; }
+        public decimal? QuantityOrdered { get; set; }
+        public string? OrderUom { get; set; }
+        public decimal? UnitCost { get; set; }
+        public decimal? ExtendedCost { get; set; }
+        public DateTime? RequiredDate { get; set; }
+        public string? GlAccount { get; set; }
+        public bool IsActive { get; set; }
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+// this is needed for the "my queue" filtering. /api/po/my
+
+namespace ITTPortal.Core.Entities.POApprovals.Views
+{
+    [Keyless]
+    [Table("vw_PO_My_Todo", Schema = "dbo")]
+    public class PoMyTodoView
+    {
+        public string PoNumber { get; set; } = null!;
+        public int Sequence { get; set; }
+        public string RoleCode { get; set; } = null!;
+        public DateTime? PoDate { get; set; }
+        public string? VendorName { get; set; }
+        public string? BuyerCode { get; set; }
+        public string? BuyerName { get; set; }
+        public string? HouseCode { get; set; }
+        public decimal? DirectAmount { get; set; }
+        public decimal? IndirectAmount { get; set; }
+        public decimal TotalAmount { get; set; }
+        public DateTime? CreatedAtUtc { get; set; }
+        public string? ApproverUserId { get; set; }
+        public int ActiveLineCount { get; set; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_Approval_Audit", Schema = "dbo")]
+    public class PoApprovalAudit
+    {
+        [Key]
+        public long AuditId { get; set; }
+
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+
+        public char OldStatus { get; set; }
+        public char NewStatus { get; set; }
+
+        [MaxLength(100)]
+        public string ChangedBy { get; set; } = null!;
+
+        public DateTime ChangedAtUtc { get; set; }
+        public string? DecisionNote { get; set; }
+
+        public int? Sequence { get; set; }
+
+        [MaxLength(40)]
+        public string? RoleCode { get; set; }
+
+        public char? Category { get; set; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_ApprovalChain", Schema = "dbo")]
+    public class PoApprovalChain
+    {
+        [Key]
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+
+        public DateTime CreatedAtUtc { get; set; }
+        public char Status { get; set; } // 'P','A','D'
+        public DateTime? FinalizedAtUtc { get; set; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_ApprovalOutbox", Schema = "dbo")]
+    public class PoApprovalOutbox
+    {
+        [Key]
+        public long OutboxId { get; set; }
+
+        [MaxLength(40)]
+        public string EventType { get; set; } = null!;
+
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+
+        public DateTime OccurredAtUtc { get; set; }
+        public string? PayloadJson { get; set; }
+        public int Attempts { get; set; }
+        public DateTime? ProcessedAtUtc { get; set; }
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? DirectAmount { get; set; }
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? IndirectAmount { get; set; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_ApprovalStage", Schema = "dbo")]
+    public class PoApprovalStage
+    {
+        [MaxLength(20)]
+        public string PoNumber { get; set; } = null!;
+        public int Sequence { get; set; } // PK part
+
+        [MaxLength(50)]
+        public string RoleCode { get; set; } = null!;
+
+        [MaxLength(100)]
+        public string? ApproverUserId { get; set; }
+
+        public char? Category { get; set; } // 'I'/'D'/null
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? ThresholdFrom { get; set; }
+
+        [Column(TypeName = "decimal(18,2)")]
+        public decimal? ThresholdTo { get; set; }
+
+        public char Status { get; set; } // 'P','A','D','S'
+        public DateTime? DecidedAtUtc { get; set; }
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_Stg_Header")]
+    [Keyless]
+    public class PoStgHeader
+    {
+        public string? PoNumber { get; set; }
+
+        public DateTime? PoDate { get; set; }
+
+        public string? VendorNumber { get; set; }
+
+        public string? VendorName { get; set; }
+
+        public string? VendorAddr1 { get; set; }
+
+        public string? VendorAddr2 { get; set; }
+
+        public string? VendorAddr3 { get; set; }
+
+        public string? VendorState { get; set; }
+
+        public string? VendorPostalCode { get; set; }
+
+        public string? BuyerCode { get; set; }
+
+        public string? BuyerName { get; set; }
+
+        public string? HouseCode { get; set; }
+
+        public decimal? DirectAmount { get; set; }
+
+        public decimal? IndirectAmount { get; set; }
+
+        public DateTime? CreatedAtUtc { get; set; }
+    }
+}
+
+using Microsoft.EntityFrameworkCore;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_Stg_Line")]
+    [Keyless]
+    public class PoStgLine
+    {
+        public string? PoNumber { get; set; }
+
+        public int? LineNumber { get; set; }
+
+        public string? HouseCode { get; set; }
+
+        public string? ItemNumber { get; set; }
+
+        public string? ItemDescription { get; set; }
+
+        public string? ItemShortDescription { get; set; }
+
+        public decimal? QuantityOrdered { get; set; }
+
+        public string? OrderUom { get; set; }
+
+        public decimal? UnitCost { get; set; }
+
+        public decimal? ExtendedCost { get; set; }
+
+        public DateTime? RequiredDate { get; set; }
+
+        public string? GlAccount { get; set; }
+
+        public DateTime? CreatedAtUtc { get; set; }
+
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_DelegationOfAuthority_Direct_Material", Schema = "dbo")]
+    public record class SqlDelegationOfAuthorityDirectMaterial
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; init; }
+
+        [MaxLength(50)]
+        public string Level { get; init; } = null!;
+
+        [Column(TypeName = "decimal(19,4)")]
+        public decimal Amount { get; init; }
+    }
+}
+
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace ITTPortal.Core.Entities.POApprovals
+{
+    [Table("PO_DelegationOfAuthority_Indirect_Expense", Schema = "dbo")]
+    public record class SqlDelegationOfAuthorityIndirectExpense
+    {
+        [Key]
+        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]
+        public int Id { get; init; }
+
+        [MaxLength(50)]
+        public string Level { get; init; } = null!;
+
+        [Column(TypeName = "decimal(19,4)")]
+        public decimal Amount { get; init; }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalAuditConfiguration : IEntityTypeConfiguration<PoApprovalAudit>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalAudit> b)
+        {
+            b.ToTable("PO_Approval_Audit", "dbo");
+            b.HasKey(x => x.AuditId);
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+            b.Property(x => x.ChangedBy).HasMaxLength(100).IsRequired();
+            b.Property(x => x.ChangedAtUtc).HasDefaultValueSql("sysutcdatetime()");
+            b.Property(x => x.DecisionNote).HasMaxLength(4000);
+            b.HasIndex(x => new { x.PoNumber, x.Sequence, x.RoleCode, x.ChangedAtUtc })
+             .HasDatabaseName("IX_PO_Approval_Audit_PO_Stage");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalChainConfiguration : IEntityTypeConfiguration<PoApprovalChain>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalChain> b)
+        {
+            b.ToTable("PO_ApprovalChain", "dbo");
+            b.HasKey(x => x.PoNumber);
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+
+            b.Property(x => x.Status).HasDefaultValue('P');
+            b.Property(x => x.CreatedAtUtc).HasDefaultValueSql("sysutcdatetime()");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalOutboxConfiguration : IEntityTypeConfiguration<PoApprovalOutbox>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalOutbox> b)
+        {
+            b.ToTable("PO_ApprovalOutbox", "dbo");
+            b.HasKey(x => x.OutboxId);
+
+            b.Property(x => x.EventType).HasMaxLength(40).IsRequired();
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+            b.Property(x => x.OccurredAtUtc).HasDefaultValueSql("sysutcdatetime()");
+            b.Property(x => x.Attempts).HasDefaultValue(0);
+
+            // Matches your filtered unique index for unprocessed events:
+            b.HasIndex(x => new { x.EventType, x.PoNumber })
+             .HasDatabaseName("UX_PO_ApprovalOutbox_Unprocessed")
+             .IsUnique()
+             .HasFilter("[ProcessedAtUtc] IS NULL");
+
+            b.HasIndex(x => new { x.ProcessedAtUtc, x.Attempts })
+             .HasDatabaseName("IX_PO_ApprovalOutbox_Queued");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsApprovalStageConfiguration : IEntityTypeConfiguration<PoApprovalStage>
+    {
+        public void Configure(EntityTypeBuilder<PoApprovalStage> b)
+        {
+            b.ToTable("PO_ApprovalStage", "dbo");
+            b.HasKey(x => new { x.PoNumber, x.Sequence });
+
+            b.Property(x => x.PoNumber).HasMaxLength(20).IsRequired();
+            b.Property(x => x.RoleCode).HasMaxLength(40).IsRequired();
+            b.Property(x => x.Status).HasDefaultValue('P');
+
+            b.HasIndex(x => new { x.PoNumber, x.Status, x.Sequence })
+             .HasDatabaseName("IX_PO_ApprovalStage_Po_Status_Seq");
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsDelegationOfAuthorityDirectMaterialConfiguration
+    : IEntityTypeConfiguration<SqlDelegationOfAuthorityDirectMaterial>
+    {
+        public void Configure(EntityTypeBuilder<SqlDelegationOfAuthorityDirectMaterial> b)
+        {
+            b.ToTable("PO_DelegationOfAuthority_Direct_Material", "dbo");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Level).HasMaxLength(50).IsRequired();
+            b.Property(x => x.Amount).HasColumnType("decimal(19,4)").IsRequired();
+            b.HasIndex(x => x.Level).IsUnique();
+        }
+    }
+
+
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class POApprovalsDelegationOfAuthorityIndirectExpenseConfiguration
+        : IEntityTypeConfiguration<SqlDelegationOfAuthorityIndirectExpense>
+    {
+        public void Configure(EntityTypeBuilder<SqlDelegationOfAuthorityIndirectExpense> b)
+        {
+            b.ToTable("PO_DelegationOfAuthority_Indirect_Expense", "dbo");
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Level).HasMaxLength(50).IsRequired();
+            b.Property(x => x.Amount).HasColumnType("decimal(19,4)").IsRequired();
+            b.HasIndex(x => x.Level).IsUnique();
+        }
+    }
+
+}
+
+using ITTPortal.Core.Entities.POApprovals.Views;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class PoHeaderViewConfiguration : IEntityTypeConfiguration<PoHeaderView>
+    {
+        public void Configure(EntityTypeBuilder<PoHeaderView> b)
+        {
+            b.ToView("vw_PO_Header_WaitingActive", "dbo");
+            b.HasNoKey();
+            // read-only view; EF will not try to write because it's a view + no key
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals.Views;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class PoLineViewConfiguration : IEntityTypeConfiguration<PoLineView>
+    {
+        public void Configure(EntityTypeBuilder<PoLineView> b)
+        {
+            b.ToView("vw_PO_Line_Active", "dbo");
+            b.HasNoKey();
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals.Views;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    public sealed class PoMyTodoViewConfiguration : IEntityTypeConfiguration<PoMyTodoView>
+    {
+        public void Configure(EntityTypeBuilder<PoMyTodoView> b)
+        {
+            b.ToView("vw_PO_My_Todo", "dbo");
+            b.HasNoKey();
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    internal class POApprovalsPoStgHeaderConfiguration : IEntityTypeConfiguration<PoStgHeader>
+    {
+        public void Configure(EntityTypeBuilder<PoStgHeader> builder)
+        {
+            builder.ToTable("PO_Stg_Header", "dbo");
+            builder.HasNoKey();
+            builder.Property(p => p.PoNumber).HasMaxLength(20);
+            builder.Property(p => p.VendorNumber).HasMaxLength(20);
+            builder.Property(p => p.VendorName).HasMaxLength(80);
+            builder.Property(p => p.VendorAddr1).HasMaxLength(80);
+            builder.Property(p => p.VendorAddr2).HasMaxLength(80);
+            builder.Property(p => p.VendorAddr3).HasMaxLength(80);
+            builder.Property(p => p.VendorState).HasMaxLength(20);
+            builder.Property(p => p.VendorPostalCode).HasMaxLength(20);
+            builder.Property(p => p.BuyerCode).HasMaxLength(10);
+            builder.Property(p => p.BuyerName).HasMaxLength(60);
+            builder.Property(p => p.HouseCode).HasMaxLength(10);
+            builder.Property(p => p.DirectAmount).HasColumnType("decimal(18,2)");
+            builder.Property(p => p.IndirectAmount).HasColumnType("decimal(18,2)");
+
+        }
+    }
+}
+
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ITTPortal.Infrastructure.Configurations
+{
+    internal class POApprovalsPoStgLineConfiguration : IEntityTypeConfiguration<PoStgLine>
+    {
+        public void Configure(EntityTypeBuilder<PoStgLine> builder)
+        {
+            builder.ToTable("PO_Stg_Line", "dbo");
+            builder.HasNoKey();
+            builder.Property(p => p.PoNumber).HasMaxLength(20);
+            builder.Property(p => p.LineNumber);
+            builder.Property(p => p.HouseCode).HasMaxLength(10);
+            builder.Property(p => p.ItemNumber).HasMaxLength(40);
+            builder.Property(p => p.ItemDescription).HasMaxLength(120);
+            builder.Property(p => p.ItemShortDescription).HasMaxLength(60);
+            builder.Property(p => p.QuantityOrdered).HasColumnType("decimal(18,4)");
+            builder.Property(p => p.OrderUom).HasMaxLength(12);
+            builder.Property(p => p.UnitCost).HasColumnType("decimal(18,4)");
+            builder.Property(p => p.ExtendedCost).HasColumnType("decimal(18,4)");
+            builder.Property(p => p.GlAccount).HasMaxLength(40);
+
+        }
+    }
+}
+
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalAuditRepository : IPoApprovalAuditRepository
+    {
+        private readonly PortalDbContext _db;
+        public PoApprovalAuditRepository(PortalDbContext db) => _db = db;
+
+        public async Task InsertAsync(string poNumber, char oldStatus, char newStatus, string changedBy,
+                                      string? note, int? sequence, string? roleCode, char? category,
+                                      CancellationToken ct)
+        {
+            _db.Set<PoApprovalAudit>().Add(new PoApprovalAudit
+            {
+                PoNumber = poNumber,
+                OldStatus = oldStatus,
+                NewStatus = newStatus,
+                ChangedBy = changedBy,
+                ChangedAtUtc = DateTime.UtcNow,
+                DecisionNote = note,
+                Sequence = sequence,
+                RoleCode = roleCode,
+                Category = category
+            });
+
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+}
+
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+using System.Data;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalChainRepository : IPoApprovalChainRepository
+    {
+        private readonly PortalDbContext _db;
+        public PoApprovalChainRepository(PortalDbContext db) => _db = db;
+
+        public Task<bool> ChainExistsAsync(string poNumber, CancellationToken ct)
+            => _db.Set<PoApprovalChain>().AnyAsync(x => x.PoNumber == poNumber, ct);
+
+        public async Task CreateChainAsync(string poNumber, CancellationToken ct)
+        {
+            _db.Set<PoApprovalChain>().Add(new PoApprovalChain
+            {
+                PoNumber = poNumber,
+                Status = 'P',
+                CreatedAtUtc = DateTime.UtcNow
+            });
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task InsertStagesAsync(string poNumber, IEnumerable<(int Seq, string RoleCode)> stages, CancellationToken ct)
+        {
+            if (stages == null) return;
+
+            var entities = stages.Select(s => new PoApprovalStage
+            {
+                PoNumber = poNumber,
+                Sequence = s.Seq,
+                RoleCode = s.RoleCode,
+                Status = 'P'
+            }).ToList();
+
+            _db.Set<PoApprovalStage>().AddRange(entities);
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task<(int Seq, string RoleCode)?> GetFirstPendingStageAsync(string poNumber, CancellationToken ct)
+        {
+            var s = await _db.Set<PoApprovalStage>()
+                .AsNoTracking()
+                .Where(x => x.PoNumber == poNumber && x.Status == 'P')
+                .OrderBy(x => x.Sequence)
+                .Select(x => new { x.Sequence, x.RoleCode })
+                .FirstOrDefaultAsync(ct);
+
+            return s is null ? null : (s.Sequence, s.RoleCode);
+        }
+
+        public async Task SetStageStatusAsync(string poNumber, int sequence, char newStatus, CancellationToken ct)
+        {
+            // Only update if currently 'P' to mirror the WHERE Status='P' guard
+            var stage = await _db.Set<PoApprovalStage>()
+                .FirstOrDefaultAsync(x => x.PoNumber == poNumber && x.Sequence == sequence && x.Status == 'P', ct);
+            if (stage is null) return;
+
+            stage.Status = newStatus;
+            if (newStatus is 'A' or 'D' or 'S')
+                stage.DecidedAtUtc = DateTime.UtcNow;
+
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task<bool> AllStagesApprovedAsync(string poNumber, CancellationToken ct)
+        {
+            var anyPending = await _db.Set<PoApprovalStage>()
+                .AnyAsync(x => x.PoNumber == poNumber && x.Status == 'P', ct);
+
+            return !anyPending;
+        }
+
+        public async Task FinalizeChainAsync(string poNumber, char finalStatus, CancellationToken ct)
+        {
+            var chain = await _db.Set<PoApprovalChain>()
+                .FirstOrDefaultAsync(x => x.PoNumber == poNumber, ct);
+            if (chain is null) return;
+
+            chain.Status = finalStatus;
+            chain.FinalizedAtUtc = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.POApprovals.Models;
+using Microsoft.EntityFrameworkCore;
+using System.Data;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalOutboxRepository : IPoApprovalOutboxRepository
+    {
+        private readonly PortalDbContext _db;
+        private readonly ILoggerService _log;
+
+        public PoApprovalOutboxRepository(PortalDbContext db, ILoggerService log)
+            => (_db, _log) = (db, log);
+
+        public async Task<IReadOnlyList<OutboxEventRow>> GetUnprocessedNewWaitingAsync(int top, CancellationToken ct)
+        {
+            var rows = await _db.Set<PoApprovalOutbox>()
+                .AsNoTracking()
+                .Where(x => x.ProcessedAtUtc == null && x.EventType == "PO_NEW_WAITING")
+                .OrderBy(x => x.OutboxId)
+                .Take(top)
+                .Select(x => new OutboxEventRow(
+                    x.OutboxId,
+                    x.PoNumber,
+                    x.EventType,
+                    x.OccurredAtUtc,
+                    x.DirectAmount,
+                    x.IndirectAmount))
+                .ToListAsync(ct);
+
+            return rows;
+        }
+
+        public async Task MarkProcessedAsync(long outboxId, CancellationToken ct)
+        {
+            // Load, mutate, save
+            var entity = await _db.Set<PoApprovalOutbox>()
+                .FirstOrDefaultAsync(x => x.OutboxId == outboxId, ct);
+            if (entity is null) return;
+
+            entity.ProcessedAtUtc = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task IncrementAttemptsAsync(long outboxId, CancellationToken ct)
+        {
+            var entity = await _db.Set<PoApprovalOutbox>()
+                .FirstOrDefaultAsync(x => x.OutboxId == outboxId, ct);
+            if (entity is null) return;
+
+            entity.Attempts += 1;
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.EntityFrameworkCore;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalsDelegationOfAuthorityRepository : IPoApprovalsDelegationOfAuthorityRepository
+    {
+        private readonly PortalDbContext _db;
+        private readonly ILoggerService _log;
+        private const string app = "ITTPortal.Infrastructure.Repositories.PoApprovalsDelegationOfAuthorityRepository";
+
+        public PoApprovalsDelegationOfAuthorityRepository(PortalDbContext db, ILoggerService log)
+            => (_db, _log) = (db, log);
+
+        public async Task ReplaceDirectMaterialAsync(
+    IEnumerable<SqlDelegationOfAuthorityDirectMaterial> rows,
+    CancellationToken ct)
+        {
+            var strategy = _db.Database.CreateExecutionStrategy();
+
+            await strategy.ExecuteAsync(async () =>
+            {
+                await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+                await _db.Database.ExecuteSqlRawAsync(
+                    "TRUNCATE TABLE [dbo].[PO_DelegationOfAuthority_Direct_Material];", ct);
+
+                await _db.Set<SqlDelegationOfAuthorityDirectMaterial>().AddRangeAsync(rows, ct);
+                await _db.SaveChangesAsync(ct);
+
+                await tx.CommitAsync(ct);
+            });
+
+            _log.Info($"{app} PoApprovalsDelegationOfAuthorityRepository replaced Direct Material rows: {rows.Count()}");
+        }
+
+
+        public async Task ReplaceIndirectExpenseAsync(
+    IEnumerable<SqlDelegationOfAuthorityIndirectExpense> rows,
+    CancellationToken ct)
+        {
+            var strategy = _db.Database.CreateExecutionStrategy();
+
+            await strategy.ExecuteAsync(async () =>
+            {
+                await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+                await _db.Database.ExecuteSqlRawAsync(
+                    "TRUNCATE TABLE [dbo].[PO_DelegationOfAuthority_Indirect_Expense];", ct);
+
+                await _db.Set<SqlDelegationOfAuthorityIndirectExpense>().AddRangeAsync(rows, ct);
+                await _db.SaveChangesAsync(ct);
+
+                await tx.CommitAsync(ct);
+            });
+
+            _log.Info($"{app} PoApprovalsDelegationOfAuthorityRepository replaced Indirect expense rows: {rows.Count()}");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using System.Data;
+using System.Diagnostics;
+
+namespace ITTPortal.Infrastructure.Repositories
+{
+    public sealed class PoApprovalsStagingRepository : IPoApprovalsStagingRepository
+    {
+        private const string app = "ITTPortal.Infrastructure.Repositories.PoApprovalsStagingRepository";
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public PoApprovalsStagingRepository(PortalDbContext db, ILoggerService log)
+        {
+            _db = db;
+            _log = log;
+        }
+
+        public Task ExecuteMergeAsync(CancellationToken ct)
+            => _db.Database.ExecuteSqlRawAsync("EXEC PO_IngestAndBuild;", ct);
+
+        public async Task InsertHeadersAsync(IEnumerable<PoStgHeader> rows, CancellationToken ct)
+        {
+            var list = rows as ICollection<PoStgHeader> ?? rows.ToList();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                await BulkCopyAsync("dbo.PO_Stg_Header", BuildHeaderTable(list), ct);
+                sw.Stop();
+                _log.Info($"{app} BulkCopy headers ok. Count={list.Count}, elapsedMs={sw.ElapsedMilliseconds}", content: null);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($" {app} BulkCopy headers failed.", exception: ex);
+            }
+        }
+
+
+        public async Task InsertLinesAsync(IEnumerable<PoStgLine> rows, CancellationToken ct)
+        {
+            var list = rows as ICollection<PoStgLine> ?? rows.ToList();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                await BulkCopyAsync("dbo.PO_Stg_Line", BuildLineTable(list), ct);
+                sw.Stop();
+                _log.Info($"{app} BulkCopy lines ok. Count={list.Count}, elapsedMs={sw.ElapsedMilliseconds}", content: null);
+            }
+            catch (Exception ex)
+            {
+                _log.Error($" {app} BulkCopy lines failed.", exception: ex);
+            }
+        }
+
+
+        public async Task TruncateStagingAsync(CancellationToken ct)
+        {
+            try
+            {
+                // Use plain SQL to avoid EF keyless limitations
+                await _db.Database.ExecuteSqlRawAsync("TRUNCATE TABLE dbo.PO_Stg_Line;", ct);
+                _log.Info($"{app} raw SQL TRUNCATE TABLE dbo.PO_Stg_Line ok.");
+                await _db.Database.ExecuteSqlRawAsync("TRUNCATE TABLE dbo.PO_Stg_Header;", ct);
+                _log.Info($"{app} raw SQL TRUNCATE TABLE dbo.PO_Stg_Header ok.");
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"{app} raw SQL TRUNCATE TABLE dbo.PO_Stg_Header, dbo.PO_stg_Heaer failed.", exception: ex);
+            }
+        }
+
+
+        // ---------- helpers ----------
+        private async Task BulkCopyAsync(string destination, DataTable table, CancellationToken ct)
+        {
+            var cn = (SqlConnection)_db.Database.GetDbConnection();
+            var openedHere = cn.State != ConnectionState.Open;
+            if (openedHere) await cn.OpenAsync(ct);
+
+            try
+            {
+                using var bc = new SqlBulkCopy(
+                    cn,
+                    SqlBulkCopyOptions.TableLock | SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.FireTriggers,
+                    null)
+                {
+                    DestinationTableName = destination,
+                    BatchSize = 5000,
+                    BulkCopyTimeout = 0
+                };
+
+                foreach (DataColumn c in table.Columns)
+                    bc.ColumnMappings.Add(c.ColumnName, c.ColumnName);
+
+                await bc.WriteToServerAsync(table, ct);
+            }
+            finally
+            {
+                if (openedHere) await cn.CloseAsync();
+            }
+        }
+
+        private static DataTable BuildHeaderTable(IEnumerable<PoStgHeader> rows)
+        {
+            var t = new DataTable();
+            t.Columns.Add("PoNumber", typeof(string));
+            t.Columns.Add("PoDate", typeof(DateTime));
+            t.Columns.Add("VendorNumber", typeof(string));
+            t.Columns.Add("VendorName", typeof(string));
+            t.Columns.Add("VendorAddr1", typeof(string));
+            t.Columns.Add("VendorAddr2", typeof(string));
+            t.Columns.Add("VendorAddr3", typeof(string));
+            t.Columns.Add("VendorState", typeof(string));
+            t.Columns.Add("VendorPostalCode", typeof(string));
+            t.Columns.Add("BuyerCode", typeof(string));
+            t.Columns.Add("BuyerName", typeof(string));
+            t.Columns.Add("HouseCode", typeof(string));
+            t.Columns.Add("DirectAmount", typeof(decimal));
+            t.Columns.Add("IndirectAmount", typeof(decimal));
+            t.Columns.Add("CreatedAtUtc", typeof(DateTime));
+
+            foreach (var r in rows)
+            {
+                t.Rows.Add(
+                    (object?)r.PoNumber ?? DBNull.Value,
+                    (object?)r.PoDate ?? DBNull.Value,
+                    (object?)r.VendorNumber ?? DBNull.Value,
+                    (object?)r.VendorName ?? DBNull.Value,
+                    (object?)r.VendorAddr1 ?? DBNull.Value,
+                    (object?)r.VendorAddr2 ?? DBNull.Value,
+                    (object?)r.VendorAddr3 ?? DBNull.Value,
+                    (object?)r.VendorState ?? DBNull.Value,
+                    (object?)r.VendorPostalCode ?? DBNull.Value,
+                    (object?)r.BuyerCode ?? DBNull.Value,
+                    (object?)r.BuyerName ?? DBNull.Value,
+                    (object?)r.HouseCode ?? DBNull.Value,
+                    (object?)r.DirectAmount ?? DBNull.Value,
+                    (object?)r.IndirectAmount ?? DBNull.Value,
+                    (object?)r.CreatedAtUtc ?? DBNull.Value
+                );
+            }
+            return t;
+        }
+
+        private static DataTable BuildLineTable(IEnumerable<PoStgLine> rows)
+        {
+            var t = new DataTable();
+            t.Columns.Add("PoNumber", typeof(string));
+            t.Columns.Add("LineNumber", typeof(int));
+            t.Columns.Add("HouseCode", typeof(string));
+            t.Columns.Add("ItemNumber", typeof(string));
+            t.Columns.Add("ItemDescription", typeof(string));
+            t.Columns.Add("ItemShortDescription", typeof(string));
+            t.Columns.Add("QuantityOrdered", typeof(decimal));
+            t.Columns.Add("OrderUom", typeof(string));
+            t.Columns.Add("UnitCost", typeof(decimal));
+            t.Columns.Add("ExtendedCost", typeof(decimal));
+            t.Columns.Add("RequiredDate", typeof(DateTime));
+            t.Columns.Add("GlAccount", typeof(string));
+
+            foreach (var r in rows)
+            {
+                t.Rows.Add(
+                    (object?)r.PoNumber ?? DBNull.Value,
+                    (object?)r.LineNumber ?? DBNull.Value,
+                    (object?)r.HouseCode ?? DBNull.Value,
+                    (object?)r.ItemNumber ?? DBNull.Value,
+                    (object?)r.ItemDescription ?? DBNull.Value,
+                    (object?)r.ItemShortDescription ?? DBNull.Value,
+                    (object?)r.QuantityOrdered ?? DBNull.Value,
+                    (object?)r.OrderUom ?? DBNull.Value,
+                    (object?)r.UnitCost ?? DBNull.Value,
+                    (object?)r.ExtendedCost ?? DBNull.Value,
+                    (object?)r.RequiredDate ?? DBNull.Value,
+                    (object?)r.GlAccount ?? DBNull.Value
+                );
+            }
+            return t;
+        }
+    }
+}
+
+using ITTPortal.Core.BuyersPortal.Entities;
+using ITTPortal.Core.Entities;
+using ITTPortal.Core.Entities.Holidays;
+using ITTPortal.Core.Entities.Sievo;
+using ITTPortal.Core.Entities.SSA;
+using ITTPortal.Infrastructure.Configurations;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+
+namespace ITTPortal.Infrastructure
+{
+    public class PortalDbContext : DbContext
+    {
+        private readonly IConfiguration _config;
+
+        public PortalDbContext() : base() { }
+        public PortalDbContext(DbContextOptions<PortalDbContext> options, IConfiguration config) : base(options)
+        {
+            _config = config;
+        }
+
+        protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+        {
+            optionsBuilder.UseSqlServer(
+                _config.GetConnectionString("DefaultConnection"),
+                sqlServerOptionsAction: sqlOptions =>
+                {
+                    sqlOptions.EnableRetryOnFailure();
+                    //maxRetryCount: 10,
+                    //maxRetryDelay: TimeSpan.FromSeconds(5),
+                    //errorNumbersToAdd: null);
+                }
+            );
+        }
+
+        public DbSet<Role> Roles { get; set; }
+        public DbSet<ParLogs> ParLogs { get; set; }
+        public DbSet<UserRole> UserRoles { get; set; }
+        public DbSet<UserModule> UserModules { get; set; }
+        public DbSet<Permission> Permissions { get; set; }
+        public DbSet<RolePermission> RolePermissions { get; set; }
+        public DbSet<Usr> Users { get; set; }
+        public DbSet<Country> Country { get; set; }
+        public DbSet<State> States { get; set; }
+        public DbSet<City> Cities { get; set; }
+        public DbSet<Employee> Employees { get; set; }
+        public DbSet<EmployeeLeave> EmployeeLeaves { get; set; }
+        public DbSet<LeaveRequest> LeaveRequests { get; set; }
+        public DbSet<DayOff> DayOffs { get; set; }
+        public DbSet<LeaveType> LeaveTypes { get; set; }
+        public DbSet<LeaveTypeRule> LeaveTypeRules { get; set; }
+        public DbSet<CountryEmployee> CountryEmployees { get; set; }
+        public DbSet<BusinessUnit> BusinessUnits { get; set; }
+        public DbSet<BusinessUnitEmployee> BusinessUnitEmployees { get; set; }
+        public DbSet<ServiceType> ServiceTypes { get; set; }
+        public DbSet<Office> Offices { get; set; }
+        public DbSet<OfficeContact> OfficeContacts { get; set; }
+        public DbSet<OfficeServiceArea> OfficeServiceAreas { get; set; }
+        public DbSet<OfficeServiceAreaView> OfficeServiceAreaViews { get; set; }
+        public DbSet<FaqCategory> FaqCategories { get; set; }
+        public DbSet<Faq> Faqs { get; set; }
+        public DbSet<ContactTicket> ContactTickets { get; set; }
+        public DbSet<HitCounter> HitCounters { get; set; }
+        public DbSet<County> Counties { get; set; }
+        public DbSet<ZipCode> ZipCodes { get; set; }
+        public DbSet<Announcement> Announcements { get; set; }
+        public DbSet<RMARequest> RMARequests { get; set; }
+        public DbSet<RMAStatus> RMAStatuses { get; set; }
+        public DbSet<Disposition> Dispositions { get; set; }
+        public DbSet<RMASalePerson> RMASalePersons { get; set; }
+        public DbSet<SDARSupplier> SDARSuppliers { get; set; }
+        public DbSet<CAPRequest> CAPRequests { get; set; }
+        public DbSet<Udl> Udls { get; set; }
+        public DbSet<UdlValue> UdlValues { get; set; }
+        public DbSet<UdlDetailValue> UdlDetailValues { get; set; }
+        public DbSet<Tag> Tags { get; set; }
+        public DbSet<TagEmployee> TagEmployees { get; set; }
+        public DbSet<TagViewEmployee> TagViewEmployees { get; set; }
+        public DbSet<Supplier> Suppliers { get; set; }
+
+        public DbSet<UdlValuePermission> UdlValuePermission { get; set; }
+        public DbSet<RulesControls> RulesControls { get; set; }
+        public DbSet<CronJob> CronJobs { get; set; }
+
+        public DbSet<CronJobServiceBus> CronJobServiceBus { get; set; }
+        public DbSet<UserProfile> UserProfiles { get; set; }
+
+        public DbSet<Question> Questions { get; set; }
+        public DbSet<Answer> Answer { get; set; }
+        public DbSet<BaseSupplier> BaseSuppliers { get; set; }
+        public DbSet<SSASupplier> SSASuppliers { get; set; }
+        public DbSet<SupplierContact> SupplierContacts { get; set; }
+        public DbSet<SSAApprover> SSAApprovers { get; set; }
+        public DbSet<SSAHighRiskTeam> SSAHighRiskTeams { get; set; }
+        public DbSet<SSASupplierApprover> SSASupplierApprovers { get; set; }
+
+        public DbSet<SSASupplierValueCenter> SSASupplierValueCenters { get; set; }
+        public DbSet<RenewalSurvey> SSARenewalSurveys { get; set; }
+
+        public DbSet<ReSubmittedLegalSurvey> ReSubmittedLegalSurveys { get; set; }
+        public DbSet<LegalSurvey> LegalSurveys { get; set; }
+        public DbSet<RenewalLegalSurvey> RenewalLegalSurveys { get; set; }
+        public DbSet<SSALegalSurveyUploadedDocument> SSALegalSurveyUploadedDocuments { get; set; }
+
+        public DbSet<SSAUploadedDocument> SSAUploadedDocument { get; set; }
+        public DbSet<BaseUploadedDocument> UploadedDocument { get; set; }
+        public DbSet<ReSubmitedSurvey> ReSubmitedSurveys { get; set; }
+        public DbSet<CLMSupplier> CLMSuppliers { get; set; }
+        public DbSet<CLMOwner> CLMOwners { get; set; }
+        public DbSet<CLMVcItLeader> CLMVcItLeaders { get; set; }
+        public DbSet<CLMStakeholder> CLMStakeholders { get; set; }
+        public DbSet<CLMSupplierOwner> CLMSupplierOwners { get; set; }
+        public DbSet<CLMSupplierStakeHolder> CLMSupplierStakeHolders { get; set; }
+        public DbSet<CLMContract> CLMContracts { get; set; }
+        public DbSet<CLMContractHistory> CLMContractHistories { get; set; }
+        public DbSet<CLMContractEmailLog> CLMContractEmailLogs { get; set; }
+        public DbSet<CLMContractReminder> CLMContractReminders { get; set; }
+        public DbSet<CLMContractObligation> CLMContractObligations { get; set; }
+        public DbSet<CLMContractDocument> CLMContractDocuments { get; set; }
+        public DbSet<CLMContractStakeholder> CLMContractStakeholders { get; set; }
+        public DbSet<CLMContractVC> CLMContractValueCenters { get; set; }
+        public DbSet<CLMProductCategory> CLMProductCategories { get; set; }
+        public DbSet<CLMDepartment> CLMDepartments { get; set; }
+        public DbSet<CLMContractEvent> CLMContractEvents { get; set; }
+        public DbSet<CLMContractEventNote> CLMContractEventNotes { get; set; }
+        public DbSet<CLMContractEventTask> CLMContractEventTasks { get; set; }
+        public DbSet<CLMContractEventHist> CLMContractEventHistories { get; set; }
+
+        public DbSet<CLMRenewalType> CLMRenewTypes { get; set; }
+
+        public DbSet<CodeOfConduct> CodeOfConduct { get; set; }
+        public DbSet<SupplierRequirement> SupplierRequirements { get; set; }
+        public DbSet<RequirementUploadedDocument> RequirementUploadedDocuments { get; set; }
+        public DbSet<SupplierRequirementResponse> SupplierRequirementResponses { get; set; }
+        public DbSet<RequirementResponseException> RequirementResponseExceptions { get; set; }
+        public DbSet<SSASupplierSite> SSASupplierSites { get; set; }
+        public DbSet<SSASupplierBusinessUnit> SSASupplierBusinessUnits { get; set; }
+        public DbSet<SSARequirementValueCenter> SSARequirementValueCenters { get; set; }
+        public DbSet<SSARequirementSites> SSARequirementSites { get; set; }
+        public DbSet<SSARequirementBusinessUnit> SSARequirementBusinessUnits { get; set; }
+        public DbSet<SSASite> SSASites { get; set; }
+        public DbSet<SSAFaq> SSAFaqs { get; set; }
+        public DbSet<SSAFaqCategory> SSAFaqCategories { get; set; }
+
+        public DbSet<SSAFaqCategoryTypes> SSAFaqCategoryTypes { get; set; }
+        public DbSet<ContactUsRequest> ContactUsRequests { get; set; }
+        public DbSet<SSARegisterRequest> SSARegisterRequests { get; set; }
+        public DbSet<SSASiteBusinessUnit> SSASiteBusinessUnits { get; set; }
+        public DbSet<SSABusinessUnit> SSABusinessUnits { get; set; }
+        public DbSet<SSABusinessUnitValueCenter> SSABusinessUnitValueCenters { get; set; }
+        public DbSet<Calendar> Calendars { get; set; }
+        public DbSet<Project> Projects { get; set; }
+        public DbSet<ProjectTask> ProjectTasks { get; set; }
+        public DbSet<ProjectTaskSyncFusion> ProjectTaskSyncFusion { get; set; }
+        public DbSet<ProjectResource> ProjectResources { get; set; }
+        public DbSet<TaskDependency> TaskDependencies { get; set; }
+        public DbSet<TaskAssignee> TaskAssignees { get; set; }
+        public DbSet<ProjectAssignee> ProjectAssignees { get; set; }
+        public DbSet<ProjectDocument> ProjectDocuments { get; set; }
+        public DbSet<ProjectDocCategory> ProjectDocCategories { get; set; }
+        public DbSet<SSACompanyProfile> SSACompanyProfiles { get; set; }
+        public DbSet<SSACompanyProfileUploadedDocument> SSACompanyProfileUploadedDocuments { get; set; }
+        public DbSet<SSASupplierDocument> SSASupplierDocuments { get; set; }
+        //public DbSet<SSASupplierDocumentResponse> SSASupplierDocumentResponses { get; set; }
+        public DbSet<SSASupplierDocumentBusinessUnit> SSASupplierDocumentBusinessUnits { get; set; }
+        public DbSet<SSASupplierDocumentSite> SSASupplierDocumentSites { get; set; }
+        public DbSet<SSASupplierDocumentValueCenter> SSASupplierDocumentValueCenters { get; set; }
+        public DbSet<SSASupplierDocumentUploadedDocument> SSASupplierDocumentUploadedDocuments { get; set; }
+
+        public DbSet<RenewalSSADocument> RenewalSSADocuments { get; set; }
+        public DbSet<SSASupplierNotification> SSASupplierNotifications { get; set; }
+        public DbSet<SSASupplierNotificationSupplier> SSASupplierNotificationSuppliers { get; set; }
+        public DbSet<SSASupplierNotificationUploadedDocument> SSASupplierNotificationUploadedDocuments { get; set; }
+        public DbSet<UserAssignment> UserAssignments { get; set; }
+
+        public DbSet<PMNSupplier> PMNSuppliers { get; set; }
+        public DbSet<PMNApprover> PMNApprovers { get; set; }
+        public DbSet<PMNSupplierApprover> PMNSupplierAppovers { get; set; }
+        public DbSet<PMNSupplierDocument> PMNSupplierDocuments { get; set; }
+        public DbSet<PMNSupplierDocEmailLog> PMNSupplierDocEmailLogs { get; set; }
+        public DbSet<PMNDocumentType> PMNDocumentTypes { get; set; }
+        public DbSet<PMNPart> PMNParts { get; set; }
+        public DbSet<PMNPartApprover> PMNPartAppovers { get; set; }
+        public DbSet<PMNPartDocument> PMNPartDocuments { get; set; }
+
+        public DbSet<PMNSupplierPart> PMNSupplierParts { get; set; }
+        public DbSet<PMNSupplierPartChangeAction> PMNSupplierPartChangeActions { get; set; }
+        public DbSet<PMNSupplierPartType> PMNSupplierPartTypes { get; set; }
+        public DbSet<PMNSupplierPartTypeDoc> PMNSupplierPartTypeDocs { get; set; }
+        public DbSet<PMNSupplierPartDelivery> PMNSupplierPartDeliveries { get; set; }
+        public DbSet<PMNSupplierPartDeliveryDoc> PMNSupplierPartDeliveryDocs { get; set; }
+
+
+        public DbSet<Calibration> Calibrations { get; set; }
+        public DbSet<CalibrationEmployee> CalibrationEmployees { get; set; }
+        public DbSet<CalibrationYear> CalibrationYears { get; set; }
+        public DbSet<FRCUploadedDocument> FRCUploadedDocuments { get; set; }
+        public DbSet<FRCFaq> FRCFaqs { get; set; }
+        public DbSet<FRCFaqCategory> FRCFaqCategories { get; set; }
+        public DbSet<FRCFaqCategoryTypes> FRCFaqCategoryTypes { get; set; }
+
+        public DbSet<SupplierShareFile> SupplierShareFiles { get; set; }
+        public DbSet<SupplierShareFileAccessRule> SupplierShareFileAccessRules { get; set; }
+
+        public DbSet<FRCPaymentHistory> FRCPaymentHistory { get; set; }
+        public DbSet<FRCInvoiceStatus> FRCInvoiceStatus { get; set; }
+        public DbSet<FRCVendorInfo> FRCVendorInfo { get; set; }
+        public DbSet<FRCCurYrInvoices> FRCCurYrInvoices { get; set; }
+        public DbSet<FRCInvoicePoStatus> FRCInvoicePoStatus { get; set; }
+        public DbSet<FRCInvoiceLineItem> FRCInvoiceLineItem { get; set; }
+        public DbSet<FRCDolApT> FRCDolApT { get; set; }
+        public DbSet<FRCValueCentersFilter> FRCValueCentersFilter { get; set; }
+        public DbSet<FRCBusinessUnitsFilter> FRCBusinessUnitsFilter { get; set; }
+        public DbSet<FRCVendorNamesFilter> FRCVendorNamesFilter { get; set; }
+        public DbSet<FRCVendorNumFilter> FRCVendorNumFilter { get; set; }
+        public DbSet<FRCDocumentStatusFilter> FRCDocumentStatusFilter { get; set; }
+        public DbSet<FRCDocumentNumberFilter> FRCDocumentNumberFilter { get; set; }
+
+        public DbSet<FRCCompaniesFilter> FRCCompaniesFilter { get; set; }
+
+        public DbSet<FRCCreditStatusFilter> FRCCreditStatusFilter { get; set; }
+        public DbSet<FRCCustNoFilter> FRCCustNoFilter { get; set; }
+        public DbSet<FRCOsEntityFilter> FRCOsEntityFilter { get; set; }
+        public DbSet<FRCPurOrderFilter> FRCPurOrderFilter { get; set; }
+        public DbSet<FRCRefDocNoFilter> FRCRefDocNoFilter { get; set; }
+        public DbSet<FRCSalesAreaFilter> FRCSalesAreaFilter { get; set; }
+        public DbSet<FRCSalesAreaDescFilter> FRCSalesAreaDescFilter { get; set; }
+        public DbSet<FRCStatusDescFilter> FRCStatusDescFilter { get; set; }
+        public DbSet<FRCCustomerInfo> FRCCustomerInfo { get; set; }
+        public DbSet<FRCCustomerFinancialSummary> FRCCustomerFinancialSummary { get; set; }
+        public DbSet<FRCCustomerFinancialDetail> FRCCustomerFinancialDetail { get; set; }
+        public DbSet<FRCArRowLvlSecurity> FRCArRowLvlSecurity { get; set; }
+        public DbSet<FRCApRowLvlSecurity> FRCApRowLvlSecurity { get; set; }
+        public DbSet<FRCTeamMember> FRCTeamMember { get; set; }
+        public DbSet<FRCCalendarDate> FRCCalendarDates { get; set; }
+        public DbSet<EmployeeSignature> EmployeeSignatures { get; set; }
+        public DbSet<EAModule> EAModules { get; set; }
+        public DbSet<EAProcess> EAProcesses { get; set; }
+        public DbSet<EAProcessActor> EAProcessActors { get; set; }
+        public DbSet<EAProcessRequest> EAProcessRequests { get; set; }
+        public DbSet<EAProcessRequestTransLog> EAProcessRequestTransLogs { get; set; }
+        public DbSet<EAProcessStatus> EAProcessStatuses { get; set; }
+        public DbSet<EATemplate> EATemplates { get; set; }
+        public DbSet<EATemplateField> EATemplateFields { get; set; }
+
+        #region Ongoarding
+        public DbSet<OnboardingEmployee> OnboardingEmployees { get; set; }
+        public DbSet<OnboardingResource> OnboardingResources { get; set; }
+        public DbSet<JobFamily> JobFamilies { get; set; }
+        public DbSet<JobFamilyGroup> JobFamilyGroups { get; set; }
+        public DbSet<JobProfile> JobProfiles { get; set; }
+        public DbSet<OnboardingSite> OnboardingSites { get; set; }
+        public DbSet<OnboardingJobFamilyResource> JobFamilyResources { get; set; }
+
+        public DbSet<OnboardingResourceDetail> OnboardingResourceDetails { get; set; }
+        public DbSet<OnboardingResourceValueCenter> OnboardingResourceValueCenters { get; set; }
+        public DbSet<OnboardingResourceDetailSite> OnboardingResourceDetailSites { get; set; }
+        public DbSet<OnboardingEmployeeJobFamilyResource> OnboardingEmployeeResources { get; set; }
+        public DbSet<OnboardingEmployeeResourcesSnapShot> OnboardingEmployeeResourcesSnapShots { get; set; }
+        public DbSet<EmployeeValueCenter> EmployeeValueCenters { get; set; }
+        #endregion
+
+        #region PCN
+
+        public DbSet<PCNCategory> PCNCategories { get; set; }
+        public DbSet<PCNDepartment> PCNDepartments { get; set; }
+        public DbSet<PCNEmployee> PCNEmployees { get; set; }
+        public DbSet<PCNEmailEmployee> PCNEmailEmployees { get; set; }
+
+        public DbSet<PCNProject> PCNProjects { get; set; }
+        public DbSet<PCNProjectDocument> PCNProjectDocuments { get; set; }
+        public DbSet<PCNProjectCategory> PCNProjectCategories { get; set; }
+        public DbSet<PCNProjectPhase> PCNProjectPhases { get; set; }
+        public DbSet<PCNProjectPhaseDoc> PCNProjectPhaseDocs { get; set; }
+
+        #endregion
+
+        #region CCA
+        public DbSet<CCAEmployee> CCAEmployees { get; set; }
+        public DbSet<CCAEmailEmployee> CCAEmailEmployees { get; set; }
+        public DbSet<CCACostCenter> CCACostCenters { get; set; }
+        public DbSet<CCACostCenterHistory> CCACostCenterHistories { get; set; }
+        public DbSet<CCAActivityType> CCAActivityTypes { get; set; }
+        public DbSet<CCAAccount> CCAAccounts { get; set; }
+        public DbSet<CCATransaction> CCATransactions { get; set; }
+        public DbSet<CCATransactionDocument> CCATransactionDocuments { get; set; }
+        public DbSet<CCACostDriver> CCACostDrivers { get; set; }
+        public DbSet<CCACostAllocation> CCACostAllocations { get; set; }
+        public DbSet<CCASiteCode> CCASiteCodes { get; set; }
+        public DbSet<CCAAccountSC> CCAAccountSCs { get; set; }
+
+        #endregion
+
+        #region PPM
+        //public DbSet<PPMStep> PPMSteps { get; set; }
+        //public DbSet<PPMTeam> PPMTeams { get; set; }
+        public DbSet<PPMTeamMember> PPMTeamMembers { get; set; }
+        public DbSet<PPMDepartment> PPMDepartments { get; set; }
+        public DbSet<PPMSite> PPMSites { get; set; }
+        public DbSet<PPMBusinessUnit> PPMBusinessUnits { get; set; }
+        public DbSet<PPMProject> PPMProjects { get; set; }
+        public DbSet<PPMProjectTransactionLog> PPMProjectTransactionLogs { get; set; }
+        public DbSet<PPMProjectUploadedDocument> PPMProjectUploadedDocuments { get; set; }
+        public DbSet<PPMProjectBPOStakeholderLog> PPMProjectBPOStakeholderLogs { get; set; }
+        public DbSet<PPMProjectITReviewerLog> PPMProjectITReviewerLogs { get; set; }
+        public DbSet<PPMCriteriaWeight> PPMCriteriaWeights { get; set; }
+        public DbSet<PPMProjectScore> PPMProjectScores { get; set; }
+        public DbSet<PPMValueCenter> PPMValueCenters { get; set; }
+        public DbSet<PPMProjectType> PPMProjectTypes { get; set; }
+        public DbSet<PPMBRMEmployee> PPMBRMEmployees { get; set; }
+        public DbSet<PPMBusinessUnitLocation> PPMBusinessUnitLocations { get; set; }
+
+        #endregion
+
+        #region Sievo Sets
+
+        public DbSet<SievoSupplier> SP_DEV_VM { get; set; }
+        public DbSet<SievoSupplierLocation> SP_DEV_WG { get; set; }
+        //public DbSet<SievoSupplierPartInfo> SievoSupplierPartsInfo { get; set; }
+        #endregion
+
+        #region Entity List
+        public DbSet<EntityList> EntityLists { get; set; }
+        #endregion
+
+
+        #region Document Storage Sets 
+
+        DbSet<FileMeta> FilesMeta { get; set; }
+        DbSet<FileBytes> FilesBytes { get; set; }
+        #endregion
+
+
+        #region POApprovals
+
+        public DbSet<Core.Entities.POApprovals.PoStgHeader> PoStgHeaders { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoStgLine> PoStgLines { get; set; }
+        public DbSet<Core.Entities.POApprovals.SqlDelegationOfAuthorityDirectMaterial> PoDelegationOfAuthorityDirectMaterials { get; set; }
+        public DbSet<Core.Entities.POApprovals.SqlDelegationOfAuthorityIndirectExpense> PoDelegationOfAuthorityIndirectExpenses { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalChain> PoApprovalChains { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalStage> PoApprovalStages { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalOutbox> PoApprovalOutboxes { get; set; }
+        public DbSet<Core.Entities.POApprovals.PoApprovalAudit> PoApprovalAudits { get; set; }
+        // Read-only views
+        public DbSet<ITTPortal.Core.Entities.POApprovals.Views.PoHeaderView> PoHeaderViews { get; set; }
+        public DbSet<ITTPortal.Core.Entities.POApprovals.Views.PoLineView> PoLineViews { get; set; }
+        // (for /api/po/my later)
+        public DbSet<ITTPortal.Core.Entities.POApprovals.Views.PoMyTodoView> PoMyTodo { get; set; }
+
+
+        #endregion
+
+        public DbSet<SSASelfEvaluation> SSASelfEvaluations { get; set; }
+        public DbSet<SSASelfEvaluationUploadedDocument> SSASelfEvaluationUploadedDocuments { get; set; }
+        public DbSet<SupplierPartInfo> SuppliersPartInfo { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder builder)
+        {
+            base.OnModelCreating(builder);
+
+            builder.ApplyConfiguration(new RoleConfiguration());
+            builder.ApplyConfiguration(new RolePermissionConfiguration());
+            builder.ApplyConfiguration(new CountryEmployeeConfiguration());
+            builder.ApplyConfiguration(new TagEmployeeConfiguration());
+            builder.ApplyConfiguration(new TagViewEmployeeConfiguration());
+            builder.ApplyConfiguration(new CLMContractVCConfiguration());
+            builder.ApplyConfiguration(new BusinessUnitEmployeeConfiguration());
+            builder.ApplyConfiguration(new UserModuleConfiguration());
+            builder.ApplyConfiguration(new PCNProjectCategoryConfiguration());
+            builder.ApplyConfiguration(new JobFamilyResourceConfiguration());
+            builder.ApplyConfiguration(new CCAAccountSCConfiguration());
+
+            // POApprovals configurations
+            builder.ApplyConfiguration(new POApprovalsPoStgHeaderConfiguration());
+            builder.ApplyConfiguration(new POApprovalsPoStgLineConfiguration());
+            builder.ApplyConfiguration(new POApprovalsDelegationOfAuthorityDirectMaterialConfiguration());
+            builder.ApplyConfiguration(new POApprovalsDelegationOfAuthorityIndirectExpenseConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalChainConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalStageConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalOutboxConfiguration());
+            builder.ApplyConfiguration(new POApprovalsApprovalAuditConfiguration());
+            builder.ApplyConfiguration(new PoHeaderViewConfiguration());
+            builder.ApplyConfiguration(new PoLineViewConfiguration());
+            builder.ApplyConfiguration(new PoMyTodoViewConfiguration()); // optional until use /api/po/my
+
+
+            builder.Entity<Usr>()
+                 .HasMany(p => p.ShareFileAccessRules)
+                 .WithOne()
+                 .HasForeignKey(p => p.UserId);
+
+            builder.Entity<SupplierShareFile>()
+                 .HasMany(p => p.AccessRules)
+                 .WithOne()
+                 .HasForeignKey(p => p.FileId);
+
+            builder.Entity<OfficeServiceAreaView>().ToView("OfficeServiceAreaView");
+            builder.Entity<OfficeServiceAreaView>().HasNoKey(); // Views are typically read-only
+
+            // builder.ApplyConfiguration(new PermissionConfiguration());
+            // builder.ApplyConfiguration(new UserRoleConfiguration());
+            // builder.ApplyConfiguration(new UserConfiguration());
+        }
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IDelegationOfAuthorityDirectMaterialReader
+    {
+        IAsyncEnumerable<DelegationOfAuthorityDirectMaterialReaderDto> ReadAsync(CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IDelegationOfAuthorityIndirectExpenseReader
+    {
+        IAsyncEnumerable<DelegationOfAuthorityIndirectExpenseReaderDto> ReadAsync(CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IFetchWaitingApprovalJob
+    {
+        Task RunAsync(CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPoApprovalChainBuilder
+    {
+        Task<IReadOnlyList<(int Seq, string RoleCode)>> BuildAsync(
+            string poNumber, decimal? directAmount, decimal? indirectAmount, CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPoApprovalNotifier
+    {
+        Task NotifyStageReadyAsync(string poNumber, int sequence, string roleCode, CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPrmsReader
+    {
+        IAsyncEnumerable<(SqlPoHeader Header, SqlPoLine[] Lines)>
+            ReadWaitingApprovalAsync(CancellationToken ct);
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IPrmsWriter
+    {
+        Task UpdatePoStatusAsync(string poNumber, char status, CancellationToken ct); // 'A' or 'D'
+    }
+}
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface IProcessApprovalOutboxJob
+    {
+        Task RunAsync(CancellationToken ct);
+    }
+}
+
+using ITTPortal.POApprovals.Models;
+
+namespace ITTPortal.POApprovals.Abstraction
+{
+    public interface ISqlWriter
+    {
+        Task UpsertAsync(IEnumerable<SqlPoHeader> headers, IEnumerable<SqlPoLine> lines, CancellationToken ct);
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed class PoApprovalChainBuilder : IPoApprovalChainBuilder
+    {
+        private readonly ILoggerService _log;
+        public PoApprovalChainBuilder(ILoggerService log) => _log = log;
+
+        public Task<IReadOnlyList<(int Seq, string RoleCode)>> BuildAsync(
+            string poNumber, decimal? directAmount, decimal? indirectAmount, CancellationToken ct)
+        {
+            var roles = new List<string>();
+
+            // Indirect rules (manager notes)
+            if (indirectAmount is decimal i)
+            {
+                if (i <= 2000m) roles.AddRange(new[] { "LPM", "GM", "SFC" });
+                else roles.AddRange(new[] { "LPM", "GM", "SFC", "VP" });
+            }
+
+            // Direct rules
+            if (directAmount is decimal d)
+            {
+                if (d > 100_000m) roles.AddRange(new[] { "LPM", "SFC", "GM" });
+                else if (d > 50_000m) roles.Add("LPM");
+            }
+
+            // Stable de-duplication in order of appearance
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var ordered = roles.Where(r => seen.Add(r)).ToList();
+
+            var result = ordered.Select((r, idx) => (idx + 1, r)).ToList().AsReadOnly();
+            _log.Info($"ApprovalChainBuilder: PO {poNumber} -> {result.Count} stage(s).");
+            return Task.FromResult<IReadOnlyList<(int, string)>>(result);
+        }
+    }
+}
+
+using ITTPortal.POApprovals.Abstraction;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed class PoApprovalNotifier : IPoApprovalNotifier
+    {
+        public Task NotifyStageReadyAsync(string poNumber, int sequence, string roleCode, CancellationToken ct)
+            => Task.CompletedTask; // replace with email/queue later
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using Microsoft.Extensions.Configuration;
+using System.Data.Odbc;
+using System.Globalization;
+using System.Runtime.CompilerServices;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed partial class PrmsReader : IPrmsReader
+    {
+        private const string app = "ITTPortal.POApprovals.Infrastructure.PrmsReader";
+
+        private readonly string _connString;
+        private readonly ILoggerService _log;
+        private readonly IConfiguration _cfg;
+
+        public PrmsReader(IConfiguration cfg, ILoggerService log)
+        {
+            _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            _log = log ?? throw new ArgumentNullException(nameof(log));
+
+            var raw = cfg.GetConnectionString("PrmsOdbc")
+                ?? throw new InvalidOperationException("Missing connection string: PrmsOdbc");
+
+            _connString = new OdbcConnectionStringBuilder(raw).ConnectionString;
+
+            _log.Info($"{app} Initialized PrmsReader with ODBC connection.");
+        }
+
+        public async IAsyncEnumerable<(SqlPoHeader Header, SqlPoLine[] Lines)>
+            ReadWaitingApprovalAsync([EnumeratorCancellation] CancellationToken ct)
+        {
+            // 1) Seed: only POs awaiting approval - this is logical view already filtered for POs waiting approval
+            const string Q_WAITING_SEED = @"
+                select distinct P3PURCH, P3DAMNT, P3IAMNT
+                from CORP400D.GPIMI701.INPUL500
+            ";
+
+            // 2) Header query (parameterized by PURCH)
+            const string Q_HEADER = @"
+                select a.PURCH, a.VNDNO, a.HOUSE, a.BUYER, b.BMNAM as BUYERNAME,
+                       v.VNAME, v.VADD1, v.VADD2, v.VADD3, v.VSTAT, v.VZIPC,
+                       a.PODMN, a.PODDY, a.PODYR
+                from CORP400D.GPIMI701.INPOL112 a
+                inner join CORP400D.GPIMI701.MSVMP100 v on a.VNDNO = v.VNDNO
+                inner join CORP400D.GPIMI701.POBMP100 b on a.BUYER = b.BMBUY
+                where a.PURCH = ?
+            ";
+
+            // 3) Lines query (with configurable short description column)
+            //var shortDescCol = _cfg["Prms:ItemShortDescColumn"]; // e.g. "MDESC" or "SDESC" or blank
+            //var shortDescExpr = string.IsNullOrWhiteSpace(shortDescCol)
+            //    ? "CAST(NULL AS VARCHAR(60))"
+            //    : $"p.{shortDescCol}";
+
+            var Q_LINES = $@"
+                select 
+                       a.PURCH, 
+                       a.""LINE#"" as LINE_NO, 
+                       a.HOUSE, 
+                       a.PRDNO, 
+                       p.DESCP as ItemDescription, 
+                       a.SDESC as ItemShortDescription,
+                       a.QUANO, 
+                       a.ORDUM, 
+                       a.ECOST, 
+                       (a.QUANO * a.ECOST) as EstValue,
+                       a.RQ3MN, a.RQ3DY, a.RQ3YR, 
+                       a.POIGL
+                from   CORP400D.GPIMI701.INPOL300 a
+                left   join CORP400D.GPIMI701.MSPMP100 p on a.PRDNO = p.PRDNO
+                where  a.PURCH = ?
+                order  by a.""LINE#""";
+
+            //_log.Info($"{app} Starting ReadWaitingApprovalAsync. Using ItemShortDescColumn='{shortDescCol ?? "<null>"}'.");
+            _log.Info($"{app} Starting ReadWaitingApprovalAsync.");
+
+            using var cn = new OdbcConnection(_connString);
+            try
+            {
+                await cn.OpenAsync(ct).ConfigureAwait(false);
+                _log.Info($"{app} Opened ODBC connection to PRMS.");
+            }
+            catch (Exception exOpen)
+            {
+                _log.Fatal($"{app} Failed to open ODBC connection to PRMS.", exception: exOpen);
+                throw;
+            }
+
+            var candidates = new List<(string Po, decimal? Dir, decimal? Ind)>(capacity: 256);
+
+            // --------- Seed read ----------
+            try
+            {
+                _log.Info($"{app} Reading waiting-approval seed from INPUL500.");
+                using var cmd = cn.CreateCommand();
+                cmd.CommandText = Q_WAITING_SEED;
+
+                using var rdr = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                int seedCount = 0;
+
+                while (await rdr.ReadAsync(ct).ConfigureAwait(false))
+                {
+                    string? TrimStr(object? o)
+                    {
+                        if (o == null || o is DBNull) return null;
+                        var s = o.ToString()?.Trim();
+                        return string.IsNullOrWhiteSpace(s) ? null : s;
+                    }
+
+                    decimal? ToDec(object? o)
+                    {
+                        if (o == null || o is DBNull) return null;
+                        return decimal.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d : null;
+                    }
+
+                    var po = TrimStr(rdr["P3PURCH"]);
+                    if (!string.IsNullOrEmpty(po))
+                    {
+                        candidates.Add((po, ToDec(rdr["P3DAMNT"]), ToDec(rdr["P3IAMNT"])));
+                        seedCount++;
+                    }
+                }
+
+                _log.Info($"{app} Seed read complete. Candidate POs found: {seedCount}.");
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during seed read.");
+                throw;
+            }
+            catch (Exception exSeed)
+            {
+                _log.Error($"{app} Error while reading seed from INPUL500.", exception: exSeed);
+                throw;
+            }
+
+            // --------- Read header and lines for each PO ----------
+            foreach (var c in candidates)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    _log.Warning($"{app} Cancellation requested before expanding next candidate PO; stopping.");
+                    ct.ThrowIfCancellationRequested();
+                }
+
+                _log.Info($"{app} Reading header and lines for PO '{c.Po}'");
+
+                // ---- Header ----
+                SqlPoHeader? header = null;
+                try
+                {
+                    using var cmdH = cn.CreateCommand();
+                    cmdH.CommandText = Q_HEADER;
+                    cmdH.Parameters.Add(new OdbcParameter("@purch", OdbcType.VarChar) { Value = c.Po });
+
+                    using var rdrH = await cmdH.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                    if (await rdrH.ReadAsync(ct).ConfigureAwait(false))
+                    {
+                        string? S(object o) => o is DBNull ? null : o?.ToString()?.Trim();
+
+                        int? I(object o)
+                        {
+                            if (o is DBNull) return null;
+                            if (int.TryParse(o.ToString(), out var v)) return v;
+                            return null;
+                        }
+
+                        DateTime? FromYmd(int? yy, int? mm, int? dd)
+                        {
+                            if (!yy.HasValue || !mm.HasValue || !dd.HasValue) return null;
+                            try
+                            {
+                                var year = (yy.Value >= 0 && yy.Value <= 69) ? 2000 + yy.Value : 1900 + yy.Value;
+                                return new DateTime(year, Math.Clamp(mm.Value, 1, 12), Math.Clamp(dd.Value, 1, 31));
+                            }
+                            catch { return null; }
+                        }
+
+                        header = new SqlPoHeader(
+                            PoNumber: S(rdrH["PURCH"]) ?? c.Po,
+                            PoDate: FromYmd(I(rdrH["PODYR"]), I(rdrH["PODMN"]), I(rdrH["PODDY"])),
+                            VendorNumber: S(rdrH["VNDNO"]) ?? string.Empty,
+                            VendorName: S(rdrH["VNAME"]),
+                            VendorAddr1: S(rdrH["VADD1"]),
+                            VendorAddr2: S(rdrH["VADD2"]),
+                            VendorAddr3: S(rdrH["VADD3"]),
+                            VendorState: S(rdrH["VSTAT"]),
+                            VendorPostalCode: S(rdrH["VZIPC"]),
+                            BuyerCode: S(rdrH["BUYER"]),
+                            BuyerName: S(rdrH["BUYERNAME"]),
+                            HouseCode: S(rdrH["HOUSE"]),
+                            DirectAmount: c.Dir,
+                            IndirectAmount: c.Ind,
+                            CreatedAtUtc: DateTime.UtcNow
+                        );
+
+                        _log.Info($"{app} Header fetched for PO '{c.Po}'.");
+                    }
+                    else
+                    {
+                        _log.Warning($"{app} Header not found for PO '{c.Po}'. Skipping.");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _log.Warning($"{app} Cancellation requested while reading header for PO '{c.Po}'.");
+                    throw;
+                }
+                catch (Exception exHdr)
+                {
+                    _log.Error($"{app} Error while reading header for PO '{c.Po}'.", exception: exHdr);
+                    throw;
+                }
+
+                if (header is null) continue;
+
+                // ---- Lines ----
+                var lines = new List<SqlPoLine>(32);
+                try
+                {
+                    using var cmdL = cn.CreateCommand();
+                    cmdL.CommandText = Q_LINES;
+                    cmdL.Parameters.Add(new OdbcParameter("@purch", OdbcType.VarChar) { Value = c.Po });
+
+                    using var rdrL = await cmdL.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                    int lineCount = 0;
+
+                    while (await rdrL.ReadAsync(ct).ConfigureAwait(false))
+                    {
+                        string? S(object o) => o is DBNull ? null : o?.ToString()?.Trim();
+
+                        int? I(object o)
+                        {
+                            if (o is DBNull) return null;
+                            if (int.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var v)) return v;
+                            return null;
+                        }
+
+                        decimal? D(object o)
+                        {
+                            if (o is DBNull) return null;
+                            if (decimal.TryParse(o.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var v)) return v;
+                            return null;
+                        }
+
+                        DateTime? FromYmd(int? yy, int? mm, int? dd)
+                        {
+                            if (!yy.HasValue || !mm.HasValue || !dd.HasValue) return null;
+                            try
+                            {
+                                var year = (yy.Value >= 0 && yy.Value <= 69) ? 2000 + yy.Value : 1900 + yy.Value;
+                                return new DateTime(year, Math.Clamp(mm.Value, 1, 12), Math.Clamp(dd.Value, 1, 31));
+                            }
+                            catch { return null; }
+                        }
+
+                        var qty = D(rdrL["QUANO"]);
+                        var unit = D(rdrL["ECOST"]);
+                        var ext = D(rdrL["EstValue"]) ?? (qty.HasValue && unit.HasValue ? qty.Value * unit.Value : (decimal?)null);
+
+                        lines.Add(new SqlPoLine(
+                            PoNumber: c.Po,
+                            LineNumber: I(rdrL["LINE_NO"]) ?? 0,
+                            HouseCode: S(rdrL["HOUSE"]),
+                            ItemNumber: S(rdrL["PRDNO"]),
+                            ItemDescription: S(rdrL["ItemDescription"]),
+                            ItemShortDescription: S(rdrL["ItemShortDescription"]),
+                            QuantityOrdered: qty,
+                            OrderUom: S(rdrL["ORDUM"]),
+                            UnitCost: unit,
+                            ExtendedCost: ext,
+                            RequiredDate: FromYmd(I(rdrL["RQ3YR"]), I(rdrL["RQ3MN"]), I(rdrL["RQ3DY"])),
+                            GlAccount: S(rdrL["POIGL"])
+                        ));
+                        lineCount++;
+                    }
+
+                    _log.Info($"{app} Lines fetched for PO '{c.Po}': {lineCount}.");
+                }
+                catch (OperationCanceledException)
+                {
+                    _log.Warning($"{app} Cancellation requested while reading lines for PO '{c.Po}'.");
+                    throw;
+                }
+                catch (Exception exLines)
+                {
+                    _log.Error($"{app} Error while reading lines for PO '{c.Po}'.", exception: exLines);
+                    throw;
+                }
+
+                // Emit result for this PO
+                yield return (header, lines.ToArray());
+            }
+
+            _log.Info($"{app} Completed ReadWaitingApprovalAsync: all {candidates.Count} candidate POs processed.");
+        }
+    }
+}
+
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using System.Data.Odbc;
+using System.Runtime.CompilerServices;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed partial class PrmsReader :
+        IDelegationOfAuthorityDirectMaterialReader,
+        IDelegationOfAuthorityIndirectExpenseReader
+    {
+        public async IAsyncEnumerable<DelegationOfAuthorityDirectMaterialReaderDto> ReadAsync(
+            [EnumeratorCancellation] CancellationToken ct)
+        {
+            const string SQL = @"select P1AMNT, P1LEVEL from CORP400D.GPIMI701.INPDP500";
+
+            using var cn = new OdbcConnection(_connString);
+            await cn.OpenAsync(ct);
+
+            using var cmd = cn.CreateCommand();
+            cmd.CommandText = SQL;
+
+            using var rdr = await cmd.ExecuteReaderAsync(ct);
+            while (await rdr.ReadAsync(ct))
+            {
+                var amount = rdr.IsDBNull(0) ? 0m : Convert.ToDecimal(rdr.GetValue(0));
+                var level = rdr.IsDBNull(1) ? string.Empty : rdr.GetValue(1)?.ToString()?.Trim() ?? string.Empty;
+                yield return new DelegationOfAuthorityDirectMaterialReaderDto(level, amount);
+            }
+        }
+
+        async IAsyncEnumerable<DelegationOfAuthorityIndirectExpenseReaderDto> IDelegationOfAuthorityIndirectExpenseReader.ReadAsync(
+            [EnumeratorCancellation] CancellationToken ct)
+        {
+            const string SQL = @"select P2AMNT, P2LEVEL from CORP400D.GPIMI701.INPEP500";
+
+            using var cn = new OdbcConnection(_connString);
+            await cn.OpenAsync(ct);
+
+            using var cmd = cn.CreateCommand();
+            cmd.CommandText = SQL;
+
+            using var rdr = await cmd.ExecuteReaderAsync(ct);
+            while (await rdr.ReadAsync(ct))
+            {
+                var amount = rdr.IsDBNull(0) ? 0m : Convert.ToDecimal(rdr.GetValue(0));
+                var level = rdr.IsDBNull(1) ? string.Empty : rdr.GetValue(1)?.ToString()?.Trim() ?? string.Empty;
+                yield return new DelegationOfAuthorityIndirectExpenseReaderDto(level, amount);
+            }
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+using Microsoft.Extensions.Configuration;
+using System.Data.Odbc;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    public sealed class PrmsWriter : IPrmsWriter
+    {
+        private readonly string _conn;
+        private readonly ILoggerService _log;
+
+        public PrmsWriter(IConfiguration cfg, ILoggerService log)
+        {
+            _log = log;
+            var raw = cfg.GetConnectionString("PrmsOdbc") ?? throw new InvalidOperationException("Missing PrmsOdbc");
+            _conn = new OdbcConnectionStringBuilder(raw).ConnectionString;
+        }
+
+        public async Task UpdatePoStatusAsync(string poNumber, char status, CancellationToken ct)
+        {
+            const string SQL = @"UPDATE CORP400D.GPIMI701.INPUP500 
+                             SET P3STAT = ?
+                             WHERE P3PURCH = ?";
+
+            var prmsValue = status == 'A' ? "Y" : "N";
+
+            using var cn = new OdbcConnection(_conn);
+            await cn.OpenAsync(ct);
+            using var cmd = cn.CreateCommand();
+            cmd.CommandText = SQL;
+            cmd.Parameters.Add(new OdbcParameter("@p3stat", OdbcType.VarChar) { Value = prmsValue });
+            cmd.Parameters.Add(new OdbcParameter("@p3purch", OdbcType.VarChar) { Value = poNumber });
+
+            var rows = await cmd.ExecuteNonQueryAsync(ct);
+            if (rows <= 0)
+                throw new InvalidOperationException($"PRMS update affected 0 rows for PO {poNumber}.");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using System.Diagnostics;
+
+namespace ITTPortal.POApprovals.Infrastructure
+{
+    /// <summary>
+    /// Uses EF-backed repository to bulk insert into staging, then calls dbo.PO_Merge.
+    /// </summary>
+    public sealed class SqlWriter : ISqlWriter
+    {
+        private const string app = "ITTPortal.POApprovals.Infrastructure.SqlWriter";
+
+        private readonly IPoApprovalsStagingRepository _repo;
+        private readonly ILoggerService _log;
+
+        public SqlWriter(IPoApprovalsStagingRepository repo, ILoggerService log)
+            => (_repo, _log) = (repo, log);
+
+        public async Task UpsertAsync(IEnumerable<SqlPoHeader> headers, IEnumerable<SqlPoLine> lines, CancellationToken ct)
+        {
+            // Materialize to avoid multiple enumeration and to get stable counts for logging
+            List<SqlPoHeader> headerList;
+            List<SqlPoLine> lineList;
+
+            try
+            {
+                headerList = headers?.ToList() ?? new List<SqlPoHeader>();
+                lineList = lines?.ToList() ?? new List<SqlPoLine>();
+            }
+            catch (Exception ex)
+            {
+                _log.Fatal($"{app} Failed to materialize incoming headers and lines.", exception: ex);
+                throw;
+            }
+
+            _log.Info($"{app} Upsert started. Incoming counts: Headers={headerList.Count}, Lines={lineList.Count}.");
+
+            if (ct.IsCancellationRequested)
+            {
+                _log.Warning($"{app} Cancellation requested before staging work begins.");
+                ct.ThrowIfCancellationRequested();
+            }
+
+            if (headerList.Count == 0 && lineList.Count == 0)
+            {
+                _log.Warning($"{app} No data to stage (0 headers, 0 lines). Skipping merge.");
+                return;
+            }
+
+            // Map to staging entities
+            List<PoStgHeader> stgHeaders;
+            List<PoStgLine> stgLines;
+
+            try
+            {
+                stgHeaders = headerList.Select(h => new PoStgHeader
+                {
+                    PoNumber = h.PoNumber,
+                    PoDate = h.PoDate,
+                    VendorNumber = h.VendorNumber,
+                    VendorName = h.VendorName,
+                    VendorAddr1 = h.VendorAddr1,
+                    VendorAddr2 = h.VendorAddr2,
+                    VendorAddr3 = h.VendorAddr3,
+                    VendorState = h.VendorState,
+                    VendorPostalCode = h.VendorPostalCode,
+                    BuyerCode = h.BuyerCode,
+                    BuyerName = h.BuyerName,
+                    HouseCode = h.HouseCode,
+                    DirectAmount = h.DirectAmount,
+                    IndirectAmount = h.IndirectAmount,
+                    CreatedAtUtc = h.CreatedAtUtc ?? DateTime.UtcNow
+                }).ToList();
+
+                var stagedAt = DateTime.UtcNow;
+                stgLines = lineList.Select(l => new PoStgLine
+                {
+                    PoNumber = l.PoNumber,
+                    LineNumber = l.LineNumber,
+                    HouseCode = l.HouseCode,
+                    ItemNumber = l.ItemNumber,
+                    ItemDescription = l.ItemDescription,
+                    ItemShortDescription = l.ItemShortDescription,
+                    QuantityOrdered = l.QuantityOrdered,
+                    OrderUom = l.OrderUom,
+                    UnitCost = l.UnitCost,
+                    ExtendedCost = l.ExtendedCost,
+                    RequiredDate = l.RequiredDate,
+                    GlAccount = l.GlAccount,
+                    CreatedAtUtc = stagedAt
+                }).ToList();
+
+                _log.Info($"{app} Mapped to staging entities. Headers={stgHeaders.Count}, Lines={stgLines.Count}.");
+            }
+            catch (Exception exMap)
+            {
+                _log.Error($"{app} Failed while mapping headers and lines to staging entities.", exception: exMap);
+                throw;
+            }
+
+            // Insert headers
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                if (stgHeaders.Count > 0)
+                {
+                    _log.Info($"{app} Inserting {stgHeaders.Count} header rows into dbo.PO_Stg_Header.");
+                    await _repo.InsertHeadersAsync(stgHeaders, ct);
+                    sw.Stop();
+                    _log.Info($"{app} Inserted {stgHeaders.Count} headers in {sw.ElapsedMilliseconds} ms.");
+                }
+                else
+                {
+                    _log.Warning($"{app} No header rows to insert into staging.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during header insert.");
+                throw;
+            }
+            catch (Exception exHdrInsert)
+            {
+                _log.Error($"{app} Header insert failed for {stgHeaders.Count} rows.", exception: exHdrInsert);
+                throw;
+            }
+
+            // Insert lines
+            sw.Restart();
+            try
+            {
+                if (stgLines.Count > 0)
+                {
+                    _log.Info($"{app} Inserting {stgLines.Count} line rows into dbo.PO_Stg_Line.");
+                    await _repo.InsertLinesAsync(stgLines, ct);
+                    sw.Stop();
+                    _log.Info($"{app} Inserted {stgLines.Count} lines in {sw.ElapsedMilliseconds} ms.");
+                }
+                else
+                {
+                    _log.Warning($"{app} No line rows to insert into staging.");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during line insert.");
+                throw;
+            }
+            catch (Exception exLineInsert)
+            {
+                _log.Error($"{app} Line insert failed for {stgLines.Count} rows.", exception: exLineInsert);
+                throw;
+            }
+
+            if (ct.IsCancellationRequested)
+            {
+                _log.Warning($"{app} Cancellation requested before merge execution.");
+                ct.ThrowIfCancellationRequested();
+            }
+
+            // Execute merge
+            sw.Restart();
+            try
+            {
+                _log.Info($"{app} Executing stored procedure dbo.PO_Merge.");
+                await _repo.ExecuteMergeAsync(ct);
+                sw.Stop();
+                _log.Info($"{app} dbo.PO_Merge completed in {sw.ElapsedMilliseconds} ms.");
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} Cancellation requested during dbo.PO_Merge.");
+                throw;
+            }
+            catch (Exception exMerge)
+            {
+                _log.Error($"{app} stored procedure dbo.PO_Merge failed.", exception: exMerge);
+                throw;
+            }
+
+            _log.Info($"{app} Upsert finished successfully. Headers={stgHeaders.Count}, Lines={stgLines.Count}.");
+        }
+    }
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    public sealed record DelegationOfAuthorityDirectMaterialReaderDto(string Level, decimal Amount);
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    public sealed record DelegationOfAuthorityIndirectExpenseReaderDto(string Level, decimal Amount);
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    public sealed record OutboxEventRow(
+        long OutboxId,
+        string PoNumber,
+        string EventType,
+        DateTime OccurredAtUtc,
+        decimal? DirectAmount,
+        decimal? IndirectAmount
+    );
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    // SqlPoHeader.cs
+
+    // Header shaped for SQL Server (clear names & types)
+    public sealed record SqlPoHeader(
+        string PoNumber,               // nvarchar(20)
+        DateTime? PoDate,              // date
+        string VendorNumber,           // nvarchar(20)
+        string? VendorName,            // nvarchar(80)
+        string? VendorAddr1,           // nvarchar(80)
+        string? VendorAddr2,           // nvarchar(80)
+        string? VendorAddr3,           // nvarchar(80)
+        string? VendorState,           // nvarchar(20)
+        string? VendorPostalCode,      // nvarchar(20)
+        string? BuyerCode,             // nvarchar(10)
+        string? BuyerName,             // nvarchar(60)
+        string? HouseCode,             // nvarchar(10)
+        decimal? DirectAmount,         // decimal(18,2)
+        decimal? IndirectAmount,       // decimal(18,2)
+        DateTime? CreatedAtUtc         // datetime2(0)
+    );
+}
+
+namespace ITTPortal.POApprovals.Models
+{
+    // SqlPoLine.cs
+
+    // Line shaped for SQL Server (clear names & types)
+    public sealed record SqlPoLine(
+        string PoNumber,               // nvarchar(20)
+        int LineNumber,                // int
+        string? HouseCode,             // nvarchar(10)
+        string? ItemNumber,            // nvarchar(40)
+        string? ItemDescription,       // nvarchar(120)
+        string? ItemShortDescription,  // nvarchar(60)
+        decimal? QuantityOrdered,      // decimal(18,4)
+        string? OrderUom,              // nvarchar(12)
+        decimal? UnitCost,             // decimal(18,4)
+        decimal? ExtendedCost,         // decimal(18,4)
+        DateTime? RequiredDate,        // date
+        string? GlAccount              // nvarchar(40)
+    );
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.POApprovals.Abstraction;
+
+namespace ITTPortal.POApprovals.Services
+{
+    public sealed class FetchDelegationOfAuthorityJob
+    {
+        private readonly IDelegationOfAuthorityDirectMaterialReader _directReader;
+        private readonly IDelegationOfAuthorityIndirectExpenseReader _indirectReader;
+        private readonly IPoApprovalsDelegationOfAuthorityRepository _repo;
+        private readonly ILoggerService _log;
+
+        public FetchDelegationOfAuthorityJob(
+            IDelegationOfAuthorityDirectMaterialReader directReader,
+            IDelegationOfAuthorityIndirectExpenseReader indirectReader,
+            IPoApprovalsDelegationOfAuthorityRepository repo,
+            ILoggerService log)
+        {
+            _directReader = directReader;
+            _indirectReader = indirectReader;
+            _repo = repo;
+            _log = log;
+        }
+
+        public async Task RunAsync(CancellationToken ct)
+        {
+            const string app = "ITTPortal.POApprovals.Services.FetchDelegationOfAuthorityJob";
+            _log.Info($"{app} start.");
+
+            var direct = new List<SqlDelegationOfAuthorityDirectMaterial>();
+            await foreach (var row in _directReader.ReadAsync(ct))
+                direct.Add(new SqlDelegationOfAuthorityDirectMaterial { Level = row.Level, Amount = row.Amount });
+
+            var indirect = new List<SqlDelegationOfAuthorityIndirectExpense>();
+            await foreach (var row in _indirectReader.ReadAsync(ct))
+                indirect.Add(new SqlDelegationOfAuthorityIndirectExpense { Level = row.Level, Amount = row.Amount });
+
+            await _repo.ReplaceDirectMaterialAsync(direct, ct);
+            await _repo.ReplaceIndirectExpenseAsync(indirect, ct);
+
+            _log.Info($"{app} complete. DirectMaterial={direct.Count}, IndirectExpense={indirect.Count}");
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.POApprovals.Abstraction;
+using ITTPortal.POApprovals.Models;
+using System.Diagnostics;
+
+namespace ITTPortal.POApprovals.Services
+{
+    public sealed class FetchWaitingApprovalJob : IFetchWaitingApprovalJob
+    {
+        private readonly IPrmsReader _reader;
+        private readonly ISqlWriter _writer;
+        private readonly ILoggerService _log;
+
+        public FetchWaitingApprovalJob(IPrmsReader reader, ISqlWriter writer, ILoggerService log)
+            => (_reader, _writer, _log) = (reader, writer, log);
+
+        public async Task RunAsync(CancellationToken ct)
+        {
+            const string app = "ITTPortal.POApprovals.Services.FetchWaitingApprovalJob";
+            var runId = Guid.NewGuid().ToString("N");
+            var swTotal = Stopwatch.StartNew();
+
+            _log.Info($"{app} [{runId}] Starting PRMS→SQL load (waiting-approval only).");
+
+            try
+            {
+                var headers = new List<SqlPoHeader>(256);
+                var lines = new List<SqlPoLine>(1024);
+
+                var swRead = Stopwatch.StartNew();
+                int yielded = 0;
+
+                await foreach (var (h, lns) in _reader.ReadWaitingApprovalAsync(ct))
+                {
+                    headers.Add(h);
+                    lines.AddRange(lns);
+                    yielded++;
+
+                    // lightweight sampling of first few POs for traceability
+                    if (yielded <= 5)
+                        _log.Info($"{app} [{runId}] Sample PO {yielded}: {h.PoNumber} (lines={lns.Length})");
+                }
+                swRead.Stop();
+
+                _log.Info($"{app} [{runId}] Reader complete in {swRead.ElapsedMilliseconds} ms. " +
+                          $"Counts: headers={headers.Count}, lines={lines.Count}.");
+
+                if (headers.Count == 0)
+                {
+                    _log.Info($"{app} [{runId}] No POs awaiting approval; exiting.");
+                    return;
+                }
+
+                var swWrite = Stopwatch.StartNew();
+                _log.Info($"{app} [{runId}] Upserting to staging and executing dbo.PO_Merge …");
+                await _writer.UpsertAsync(headers, lines, ct);
+                swWrite.Stop();
+
+                _log.Info($"{app} [{runId}] Upsert+merge finished in {swWrite.ElapsedMilliseconds} ms. " +
+                          $"Totals this run: headers={headers.Count}, lines={lines.Count}.");
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warning($"{app} [{runId}] Cancellation requested; aborting.");
+                throw; // propagate so callers respect cancellation
+            }
+            catch (Exception ex)
+            {
+                _log.Error(
+                    message: $"{app} [{runId}] FAILED. See exception details.",
+                    content: null,
+                    exception: ex
+                );
+                throw;
+            }
+
+            finally
+            {
+                swTotal.Stop();
+                _log.Info($"{app} [{runId}] Completed in {swTotal.ElapsedMilliseconds} ms.");
+            }
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Core.Entities.POApprovals;
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Abstraction;
+using Microsoft.EntityFrameworkCore;
+
+namespace ITTPortal.POApprovals.Services
+{
+    /// <summary>
+    /// Thrown when an approval action is attempted on a PO whose approval chain
+    /// is not in a Pending ('P') state (e.g., already finalized as 'A' or 'D').
+    /// Intended to be mapped to HTTP 409 by the API layer.
+    /// </summary>
+    public sealed class ChainNotPendingException : Exception
+    {
+        public string PoNumber { get; }
+        public char CurrentStatus { get; }
+
+        public ChainNotPendingException(string poNumber, char currentStatus)
+            : base($"Approval chain is not pending for PO '{poNumber}' (current status '{currentStatus}').")
+        {
+            PoNumber = poNumber;
+            CurrentStatus = currentStatus;
+        }
+    }
+
+    /// <summary>
+    /// Orchestrates local PO approval workflow.
+    /// - Stage Approve/Deny updates happen only in SQL Server (local).
+    /// - PRMS write-back happens ONLY when the chain is fully approved (final status 'A').
+    /// - Denies finalize locally and DO NOT write to PRMS.
+    /// - All steps are audited in dbo.PO_Approval_Audit.
+    /// - Guard: prevents actions after a chain is finalized (Status != 'P') by throwing ChainNotPendingException.
+    /// </summary>
+    public sealed class PoApprovalsService
+    {
+        private readonly IPoApprovalChainRepository _repo;
+        private readonly IPoApprovalAuditRepository _audit;
+        private readonly IPoApprovalNotifier _notifier;
+        private readonly IPrmsWriter _prmsWriter;
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public PoApprovalsService(IPoApprovalChainRepository repo,
+                                  IPoApprovalAuditRepository audit,
+                                  IPoApprovalNotifier notifier,
+                                  IPrmsWriter prmsWriter,
+                                  PortalDbContext db,
+                                  ILoggerService log)
+        {
+            _repo = repo ?? throw new ArgumentNullException(nameof(repo));
+            _audit = audit ?? throw new ArgumentNullException(nameof(audit));
+            _notifier = notifier ?? throw new ArgumentNullException(nameof(notifier));
+            _prmsWriter = prmsWriter ?? throw new ArgumentNullException(nameof(prmsWriter));
+            _db = db ?? throw new ArgumentNullException(nameof(db));
+            _log = log ?? throw new ArgumentNullException(nameof(log));
+        }
+
+        /// <summary>
+        /// Approves a single stage. If this action causes the whole chain to become approved,
+        /// we finalize locally AND write-back to PRMS ('A') at the end.
+        /// Throws ChainNotPendingException if the chain is not in 'P'.
+        /// </summary>
+        public async Task ApproveAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                // Guard: ensure the chain is still Pending; lock the row to avoid races.
+                _ = await LoadChainForUpdateAsync(poNumber, ct);
+
+                // 1) Local stage decision + audit
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'A', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'A', userId, note, sequence, roleCode: null, category: null, ct);
+
+                // 2) If all approved, finalize locally + audit
+                var allApproved = await _repo.AllStagesApprovedAsync(poNumber, ct);
+                if (allApproved)
+                {
+                    await _repo.FinalizeChainAsync(poNumber, 'A', ct);
+                    await _db.Database.ExecuteSqlRawAsync("UPDATE dbo.PO_Header SET Status = 'A' WHERE PoNumber = {0};", poNumber);
+                    await _audit.InsertAsync(poNumber, 'P', 'A', "system", "Chain finalized (approved)", null, null, null, ct);
+
+                    // 3) Only now, after local finalization succeeded, write back to PRMS
+                    await _prmsWriter.UpdatePoStatusAsync(poNumber, 'A', ct);
+                    _log.Info($"PO {poNumber} finalized locally (A) and written back to PRMS.");
+                }
+                else
+                {
+                    // 3) Otherwise, notify next approver (no PRMS yet)
+                    var next = await _repo.GetFirstPendingStageAsync(poNumber, ct);
+                    if (next is { } s)
+                        await _notifier.NotifyStageReadyAsync(poNumber, s.Seq, s.RoleCode, ct);
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Denies a single stage. This immediately finalizes the chain locally (D).
+        /// Per requirement, DO NOT write back to PRMS on deny.
+        /// Throws ChainNotPendingException if the chain is not in 'P'.
+        /// </summary>
+        public async Task DenyAsync(string poNumber, int sequence, string userId, string? note, CancellationToken ct)
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+            try
+            {
+                // Guard: ensure the chain is still Pending; lock the row to avoid races.
+                _ = await LoadChainForUpdateAsync(poNumber, ct);
+
+                // 1) Local stage decision + audit
+                await _repo.SetStageStatusAsync(poNumber, sequence, 'D', ct);
+                await _audit.InsertAsync(poNumber, 'P', 'D', userId, note, sequence, roleCode: null, category: null, ct);
+
+                // 2) Finalize chain locally as Denied + audit
+                await _repo.FinalizeChainAsync(poNumber, 'D', ct);
+                await _db.Database.ExecuteSqlRawAsync("UPDATE dbo.PO_Header SET Status = 'D' WHERE PoNumber = {0};", poNumber);
+                await _audit.InsertAsync(poNumber, 'P', 'D', "system", "Chain finalized (denied)", null, null, null, ct);
+
+                // 3) No PRMS write-back on deny per rule
+                _log.Info($"PO {poNumber} finalized locally (D). No PRMS write-back by design.");
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Loads the chain row with an update lock and ensures it's still pending ('P').
+        /// Throws InvalidOperationException if not found, or ChainNotPendingException if already finalized.
+        /// </summary>
+        private async Task<PoApprovalChain> LoadChainForUpdateAsync(string poNumber, CancellationToken ct)
+        {
+            // UPDLOCK + HOLDLOCK ensures a serializable-like lock on this row for the txn duration.
+            var chain = await _db.PoApprovalChains
+                .FromSqlRaw(
+                    "SELECT * FROM dbo.PO_ApprovalChain WITH (UPDLOCK, HOLDLOCK) WHERE PoNumber = {0}",
+                    poNumber)
+                .SingleOrDefaultAsync(ct);
+
+            if (chain is null)
+                throw new InvalidOperationException($"Approval chain not found for PO {poNumber}.");
+
+            if (chain.Status != 'P')
+                throw new ChainNotPendingException(poNumber, chain.Status);
+
+            return chain;
+        }
+    }
+}
+
+using ITT.Logger.Abstractions;
+using ITTPortal.Core.Abstractions;
+using ITTPortal.Infrastructure;
+using ITTPortal.POApprovals.Abstraction;
+using System.Diagnostics;
+
+namespace ITTPortal.POApprovals.Services
+{
+    /// <summary>
+    /// Consumes PO_NEW_WAITING events, creates the approval chain, notifies first approver, marks processed.
+    /// Safe to run periodically (cron).
+    /// </summary>
+    public sealed class ProcessApprovalOutboxJob : IProcessApprovalOutboxJob
+    {
+        private const string app = "ITTPortal.POApprovals.Services.ProcessApprovalOutboxJob";
+
+        private readonly IPoApprovalOutboxRepository _outbox;
+        private readonly IPoApprovalChainRepository _chainRepo;
+        private readonly IPoApprovalChainBuilder _builder;
+        private readonly IPoApprovalAuditRepository _audit;
+        private readonly IPoApprovalNotifier _notifier;
+        private readonly ILoggerService _log;
+        private readonly PortalDbContext _db;
+
+        public ProcessApprovalOutboxJob(
+            IPoApprovalOutboxRepository outbox,
+            IPoApprovalChainRepository chainRepo,
+            IPoApprovalChainBuilder builder,
+            IPoApprovalAuditRepository audit,
+            IPoApprovalNotifier notifier,
+            PortalDbContext db,
+            ILoggerService log)
+        {
+            _outbox = outbox;
+            _chainRepo = chainRepo;
+            _builder = builder;
+            _audit = audit;
+            _notifier = notifier;
+            _db = db;
+            _log = log;
+        }
+
+        public async Task RunAsync(CancellationToken ct)
+        {
+            var runId = Guid.NewGuid().ToString("N");
+            var sw = Stopwatch.StartNew();
+            _log.Info($"{app} [{runId}] Start …");
+
+            var events = await _outbox.GetUnprocessedNewWaitingAsync(top: 50, ct);
+            if (events.Count == 0)
+            {
+                _log.Info($"{app} [{runId}] No unprocessed events.");
+                return;
+            }
+
+            foreach (var ev in events)
+            {
+                if (ct.IsCancellationRequested) ct.ThrowIfCancellationRequested();
+
+                await using var tx = await _db.Database.BeginTransactionAsync(ct);
+                try
+                {
+                    // 1) Idempotent chain create
+                    if (!await _chainRepo.ChainExistsAsync(ev.PoNumber, ct))
+                    {
+                        await _chainRepo.CreateChainAsync(ev.PoNumber, ct);
+
+                        var stages = await _builder.BuildAsync(ev.PoNumber, ev.DirectAmount, ev.IndirectAmount, ct);
+                        if (stages.Count > 0)
+                            await _chainRepo.InsertStagesAsync(ev.PoNumber, stages, ct);
+
+                        await _audit.InsertAsync(ev.PoNumber, oldStatus: ' ', newStatus: 'P', changedBy: "system",
+                                                 note: "Chain initialized", sequence: null, roleCode: null, category: null, ct);
+                    }
+
+                    // 2) Notify first pending
+                    var first = await _chainRepo.GetFirstPendingStageAsync(ev.PoNumber, ct);
+                    if (first is { } s)
+                        await _notifier.NotifyStageReadyAsync(ev.PoNumber, s.Seq, s.RoleCode, ct);
+
+                    // 3) Mark event processed
+                    await _outbox.MarkProcessedAsync(ev.OutboxId, ct);
+
+                    await tx.CommitAsync(ct);
+                    _log.Info($"{app} [{runId}] PO {ev.PoNumber}: processed outbox {ev.OutboxId}.");
+                }
+                catch (Exception ex)
+                {
+                    await tx.RollbackAsync(ct);
+                    _log.Error($"{app} [{runId}] PO {ev.PoNumber}: failed; Attempts++.", exception: ex);
+                    await _outbox.IncrementAttemptsAsync(ev.OutboxId, ct);
+                }
+            }
+
+            sw.Stop();
+            _log.Info($"{app} [{runId}] Done in {sw.ElapsedMilliseconds} ms. Events: {events.Count}.");
+        }
+    }
+}
+
+using ITTPortal.Infrastructure;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace ITTPortal.Web.Controllers
+{
+    [ApiController]
+    public partial class PoController : BaseApiController
+    {
+        private readonly PortalDbContext _db;
+        public PoController(PortalDbContext db) => _db = db;
+
+        [HttpGet("api/po")]
+        public async Task<IActionResult> List(
+            [FromQuery] int page = 1,
+            [FromQuery] int pageSize = 20,
+            [FromQuery] string? search = null,
+            CancellationToken ct = default)
+        {
+            if (page <= 0) page = 1;
+            if (pageSize <= 0 || pageSize > 200) pageSize = 20;
+
+            var q = _db.PoHeaderViews.AsNoTracking();
+
+            if (!string.IsNullOrWhiteSpace(search))
+            {
+                var s = search.Trim();
+                q = q.Where(h =>
+                    h.PoNumber.Contains(s) ||
+                    (h.VendorName != null && h.VendorName.Contains(s)) ||
+                    (h.BuyerName != null && h.BuyerName.Contains(s)) ||
+                    (h.HouseCode != null && h.HouseCode.Contains(s)));
+            }
+
+            var total = await q.CountAsync(ct);
+
+            var rows = await q
+                .OrderByDescending(h => h.CreatedAtUtc ?? DateTime.MinValue)
+                .ThenBy(h => h.PoNumber)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync(ct);
+
+            return Ok(new { total, page, pageSize, rows });
+        }
+
+        [HttpGet("api/po/{poNumber}")]
+        public async Task<IActionResult> Detail(
+            [FromRoute] string poNumber,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(poNumber))
+                return BadRequest("poNumber is required.");
+
+            var header = await _db.PoHeaderViews
+                .AsNoTracking()
+                .SingleOrDefaultAsync(h => h.PoNumber == poNumber, ct);
+
+            if (header is null)
+                return NotFound();
+
+            var lines = await _db.PoLineViews
+                .AsNoTracking()
+                .Where(l => l.PoNumber == poNumber)
+                .OrderBy(l => l.LineNumber)
+                .ToListAsync(ct);
+
+            var stages = await _db.PoApprovalStages
+                .AsNoTracking()
+                .Where(s => s.PoNumber == poNumber)
+                .OrderBy(s => s.Sequence)
+                .Select(s => new
+                {
+                    s.PoNumber,
+                    s.Sequence,
+                    s.RoleCode,
+                    s.ApproverUserId,
+                    s.Category,
+                    s.ThresholdFrom,
+                    s.ThresholdTo,
+                    s.Status,
+                    s.DecidedAtUtc
+                })
+                .ToListAsync(ct);
+
+            var audit = await _db.PoApprovalAudits
+                .AsNoTracking()
+                .Where(a => a.PoNumber == poNumber)
+                .OrderByDescending(a => a.ChangedAtUtc)
+                .Select(a => new
+                {
+                    a.AuditId,
+                    a.PoNumber,
+                    a.OldStatus,
+                    a.NewStatus,
+                    a.ChangedBy,
+                    a.ChangedAtUtc,
+                    a.DecisionNote,
+                    a.Sequence,
+                    a.RoleCode,
+                    a.Category
+                })
+                .ToListAsync(ct);
+
+            return Ok(new { header, lines, stages, audit });
+        }
+    }
+}
+
+USE [WebappsDev];
+GO
+
+SET NOCOUNT ON;
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+
+/* =========================
+   TABLE: dbo.PO_Header
+   ========================= */
+IF OBJECT_ID('dbo.PO_Header','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_Header (
+        PoHeaderId         bigint IDENTITY(1,1) NOT NULL,
+        PoNumber           nvarchar(20) NOT NULL,
+        PoDate             date NULL,
+        VendorNumber       nvarchar(20) NOT NULL,
+        VendorName         nvarchar(80) NULL,
+        VendorAddr1        nvarchar(80) NULL,
+        VendorAddr2        nvarchar(80) NULL,
+        VendorAddr3        nvarchar(80) NULL,
+        VendorState        nvarchar(20) NULL,
+        VendorPostalCode   nvarchar(20) NULL,
+        BuyerCode          nvarchar(10) NULL,
+        BuyerName          nvarchar(60) NULL,
+        HouseCode          nvarchar(10) NULL,
+        DirectAmount       decimal(18,2) NULL,
+        IndirectAmount     decimal(18,2) NULL,
+        CreatedAtUtc       datetime2(0) NULL,
+        IsActive           bit NOT NULL,
+        DeactivatedAtUtc   datetime2(0) NULL,
+        DeactivatedBy      nvarchar(64) NULL,
+        DeactivationReason nvarchar(200) NULL,
+        [Status]           char(1) NOT NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_Header')
+    ALTER TABLE dbo.PO_Header ADD CONSTRAINT PK_PO_Header PRIMARY KEY CLUSTERED (PoHeaderId);
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_Header_IsActive')
+    ALTER TABLE dbo.PO_Header ADD CONSTRAINT DF_PO_Header_IsActive DEFAULT(1) FOR IsActive;
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_Header_Status')
+    ALTER TABLE dbo.PO_Header ADD CONSTRAINT DF_PO_Header_Status DEFAULT('W') FOR [Status];
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='UQ' AND [name]='UQ_PO_Header_PoNumber')
+    ALTER TABLE dbo.PO_Header ADD CONSTRAINT UQ_PO_Header_PoNumber UNIQUE (PoNumber);
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE [name]='CK_PO_Header_Status')
+    ALTER TABLE dbo.PO_Header ADD CONSTRAINT CK_PO_Header_Status CHECK ([Status] IN ('W','A','D'));
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='IX_PO_Header_StatusActive')
+    CREATE INDEX IX_PO_Header_StatusActive ON dbo.PO_Header ([Status], IsActive)
+    INCLUDE (PoNumber, PoDate, VendorName, BuyerName, HouseCode, DirectAmount, IndirectAmount);
+GO
+
+/* =========================
+   TABLE: dbo.PO_Line
+   ========================= */
+IF OBJECT_ID('dbo.PO_Line','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_Line (
+        PoLineId           bigint IDENTITY(1,1) NOT NULL,
+        PoHeaderId         bigint NOT NULL,
+        PoNumber           nvarchar(20) NOT NULL,
+        LineNumber         int NOT NULL,
+        HouseCode          nvarchar(10) NULL,
+        ItemNumber         nvarchar(40) NULL,
+        ItemDescription    nvarchar(120) NULL,
+        ItemShortDescription nvarchar(60) NULL,
+        QuantityOrdered    decimal(18,4) NULL,
+        OrderUom           nvarchar(12) NULL,
+        UnitCost           decimal(18,4) NULL,
+        ExtendedCost       decimal(18,4) NULL,
+        RequiredDate       date NULL,
+        GlAccount          nvarchar(40) NULL,
+        IsActive           bit NOT NULL,
+        DeactivatedAtUtc   datetime2(0) NULL,
+        DeactivatedBy      nvarchar(64) NULL,
+        DeactivationReason nvarchar(200) NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_Line')
+    ALTER TABLE dbo.PO_Line ADD CONSTRAINT PK_PO_Line PRIMARY KEY CLUSTERED (PoLineId);
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_Line_IsActive')
+    ALTER TABLE dbo.PO_Line ADD CONSTRAINT DF_PO_Line_IsActive DEFAULT(1) FOR IsActive;
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE [name]='FK_PO_Line_Header_PoHeaderId')
+    ALTER TABLE dbo.PO_Line ADD CONSTRAINT FK_PO_Line_Header_PoHeaderId
+        FOREIGN KEY (PoHeaderId) REFERENCES dbo.PO_Header(PoHeaderId);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='UX_PO_Line_Po_LineNumber')
+    CREATE UNIQUE INDEX UX_PO_Line_Po_LineNumber ON dbo.PO_Line (PoNumber, LineNumber);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='IX_PO_Line_PoHeaderId')
+    CREATE INDEX IX_PO_Line_PoHeaderId ON dbo.PO_Line (PoHeaderId);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='IX_PO_Line_Po_IsActive')
+    CREATE INDEX IX_PO_Line_Po_IsActive ON dbo.PO_Line (PoNumber, IsActive)
+    INCLUDE (LineNumber, ItemDescription, ExtendedCost);
+GO
+
+/* =========================
+   TABLE: dbo.PO_Approval_Audit
+   ========================= */
+IF OBJECT_ID('dbo.PO_Approval_Audit','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_Approval_Audit (
+        AuditId      bigint IDENTITY(1,1) NOT NULL,
+        PoNumber     nvarchar(20) NOT NULL,
+        OldStatus    char(1) NOT NULL,
+        NewStatus    char(1) NOT NULL,
+        ChangedBy    nvarchar(100) NOT NULL,
+        ChangedAtUtc datetime2(0) NOT NULL,
+        DecisionNote nvarchar(4000) NULL,
+        [Sequence]   int NULL,
+        RoleCode     nvarchar(40) NULL,
+        Category     char(1) NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_Approval_Audit')
+    ALTER TABLE dbo.PO_Approval_Audit ADD CONSTRAINT PK_PO_Approval_Audit PRIMARY KEY CLUSTERED (AuditId);
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_Approval_Audit_ChangedAtUtc')
+    ALTER TABLE dbo.PO_Approval_Audit ADD CONSTRAINT DF_PO_Approval_Audit_ChangedAtUtc DEFAULT (sysutcdatetime()) FOR ChangedAtUtc;
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE [name]='CK_PO_Approval_Audit_Status')
+    ALTER TABLE dbo.PO_Approval_Audit ADD CONSTRAINT CK_PO_Approval_Audit_Status
+        CHECK (OldStatus IN ('P','A','D','S',' ') AND NewStatus IN ('P','A','D','S'));
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='IX_PO_Approval_Audit_PO_Stage')
+    CREATE INDEX IX_PO_Approval_Audit_PO_Stage
+        ON dbo.PO_Approval_Audit (PoNumber, [Sequence], RoleCode, ChangedAtUtc);
+GO
+
+/* =========================
+   TABLE: dbo.PO_ApprovalChain
+   ========================= */
+IF OBJECT_ID('dbo.PO_ApprovalChain','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_ApprovalChain (
+        PoNumber       nvarchar(20) NOT NULL,
+        CreatedAtUtc   datetime2(0) NOT NULL,
+        [Status]       char(1) NOT NULL,
+        FinalizedAtUtc datetime2(0) NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_ApprovalChain')
+    ALTER TABLE dbo.PO_ApprovalChain ADD CONSTRAINT PK_PO_ApprovalChain PRIMARY KEY CLUSTERED (PoNumber);
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_ApprovalChain_CreatedAtUtc')
+    ALTER TABLE dbo.PO_ApprovalChain ADD CONSTRAINT DF_PO_ApprovalChain_CreatedAtUtc DEFAULT (sysutcdatetime()) FOR CreatedAtUtc;
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_ApprovalChain_Status')
+    ALTER TABLE dbo.PO_ApprovalChain ADD CONSTRAINT DF_PO_ApprovalChain_Status DEFAULT('P') FOR [Status];
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE [name]='CK_PO_ApprovalChain_Status')
+    ALTER TABLE dbo.PO_ApprovalChain ADD CONSTRAINT CK_PO_ApprovalChain_Status CHECK ([Status] IN ('P','A','D'));
+GO
+
+/* =========================
+   TABLE: dbo.PO_ApprovalStage
+   ========================= */
+IF OBJECT_ID('dbo.PO_ApprovalStage','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_ApprovalStage (
+        PoNumber        nvarchar(20) NOT NULL,
+        [Sequence]      int NOT NULL,
+        RoleCode        nvarchar(50) NOT NULL,
+        ApproverUserId  nvarchar(100) NULL,
+        Category        char(1) NULL, -- 'I','D', or NULL
+        ThresholdFrom   decimal(18,2) NULL,
+        ThresholdTo     decimal(18,2) NULL,
+        [Status]        char(1) NOT NULL,
+        DecidedAtUtc    datetime2(0) NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_ApprovalStage')
+    ALTER TABLE dbo.PO_ApprovalStage ADD CONSTRAINT PK_PO_ApprovalStage PRIMARY KEY CLUSTERED (PoNumber, [Sequence]);
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_ApprovalStage_Status')
+    ALTER TABLE dbo.PO_ApprovalStage ADD CONSTRAINT DF_PO_ApprovalStage_Status DEFAULT('P') FOR [Status];
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE [name]='CK_PO_ApprovalStage_Status')
+    ALTER TABLE dbo.PO_ApprovalStage ADD CONSTRAINT CK_PO_ApprovalStage_Status CHECK ([Status] IN ('P','A','D','S'));
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE [name]='CK_PO_ApprovalStage_Category')
+    ALTER TABLE dbo.PO_ApprovalStage ADD CONSTRAINT CK_PO_ApprovalStage_Category CHECK (Category IN ('I','D') OR Category IS NULL);
+IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE [name]='FK_PO_ApprovalStage_Chain')
+    ALTER TABLE dbo.PO_ApprovalStage ADD CONSTRAINT FK_PO_ApprovalStage_Chain
+        FOREIGN KEY (PoNumber) REFERENCES dbo.PO_ApprovalChain(PoNumber);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='IX_PO_ApprovalStage_Po_Status_Seq')
+    CREATE INDEX IX_PO_ApprovalStage_Po_Status_Seq
+        ON dbo.PO_ApprovalStage (PoNumber, [Status], [Sequence]);
+GO
+
+/* =========================
+   TABLE: dbo.PO_ApprovalOutbox
+   ========================= */
+IF OBJECT_ID('dbo.PO_ApprovalOutbox','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_ApprovalOutbox (
+        OutboxId       bigint IDENTITY(1,1) NOT NULL,
+        EventType      nvarchar(40) NOT NULL,
+        PoNumber       nvarchar(20) NOT NULL,
+        OccurredAtUtc  datetime2(0) NOT NULL,
+        PayloadJson    nvarchar(max) NULL,
+        Attempts       int NOT NULL,
+        ProcessedAtUtc datetime2(0) NULL,
+        DirectAmount   decimal(18,2) NULL,
+        IndirectAmount decimal(18,2) NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_ApprovalOutbox')
+    ALTER TABLE dbo.PO_ApprovalOutbox ADD CONSTRAINT PK_PO_ApprovalOutbox PRIMARY KEY CLUSTERED (OutboxId);
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_ApprovalOutbox_Occurred')
+    ALTER TABLE dbo.PO_ApprovalOutbox ADD CONSTRAINT DF_PO_ApprovalOutbox_Occurred DEFAULT (sysutcdatetime()) FOR OccurredAtUtc;
+IF NOT EXISTS (SELECT 1 FROM sys.default_constraints WHERE [name]='DF_PO_ApprovalOutbox_Attempts')
+    ALTER TABLE dbo.PO_ApprovalOutbox ADD CONSTRAINT DF_PO_ApprovalOutbox_Attempts DEFAULT (0) FOR Attempts;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='UX_PO_ApprovalOutbox_Unprocessed')
+    CREATE UNIQUE INDEX UX_PO_ApprovalOutbox_Unprocessed
+        ON dbo.PO_ApprovalOutbox (EventType, PoNumber)
+        WHERE ProcessedAtUtc IS NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='IX_PO_ApprovalOutbox_Queued')
+    CREATE INDEX IX_PO_ApprovalOutbox_Queued
+        ON dbo.PO_ApprovalOutbox (ProcessedAtUtc, Attempts);
+GO
+
+/* =========================
+   TABLE: dbo.PO_ApproverDirectory
+   ========================= */
+IF OBJECT_ID('dbo.PO_ApproverDirectory','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_ApproverDirectory (
+        RoleCode     nvarchar(50) NOT NULL,
+        HouseCode    nvarchar(10) NOT NULL CONSTRAINT DF_PO_ApproverDirectory_House DEFAULT ('GLOBAL'),
+        BuyerCode    nvarchar(10) NOT NULL CONSTRAINT DF_PO_ApproverDirectory_Buyer DEFAULT (N''),
+        UserId       nvarchar(100) NOT NULL,
+        DisplayName  nvarchar(120) NULL,
+        Email        nvarchar(256) NULL,
+        IsActive     bit NOT NULL CONSTRAINT DF_PO_ApproverDirectory_IsActive DEFAULT(1),
+        UpdatedAtUtc datetime2(0) NOT NULL CONSTRAINT DF_PO_ApproverDirectory_UpdatedAtUtc DEFAULT (sysutcdatetime())
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_ApproverDirectory')
+    ALTER TABLE dbo.PO_ApproverDirectory ADD CONSTRAINT PK_PO_ApproverDirectory PRIMARY KEY CLUSTERED (RoleCode, HouseCode, BuyerCode);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='IX_PO_ApproverDirectory_User')
+    CREATE INDEX IX_PO_ApproverDirectory_User
+        ON dbo.PO_ApproverDirectory (UserId, RoleCode, HouseCode, BuyerCode)
+        INCLUDE (IsActive, Email);
+GO
+
+/* =========================
+   TABLE: dbo.PO_DelegationOfAuthority_Direct_Material
+   ========================= */
+IF OBJECT_ID('dbo.PO_DelegationOfAuthority_Direct_Material','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_DelegationOfAuthority_Direct_Material (
+        Id     int IDENTITY(1,1) NOT NULL,
+        [Level] nvarchar(50) NOT NULL,
+        Amount  decimal(19,4) NOT NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_DoA_Direct')
+    ALTER TABLE dbo.PO_DelegationOfAuthority_Direct_Material ADD CONSTRAINT PK_PO_DoA_Direct PRIMARY KEY CLUSTERED (Id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='UX_PO_DoA_Direct_Level')
+    CREATE UNIQUE INDEX UX_PO_DoA_Direct_Level ON dbo.PO_DelegationOfAuthority_Direct_Material ([Level]);
+GO
+
+/* =========================
+   TABLE: dbo.PO_DelegationOfAuthority_Indirect_Expense
+   ========================= */
+IF OBJECT_ID('dbo.PO_DelegationOfAuthority_Indirect_Expense','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_DelegationOfAuthority_Indirect_Expense (
+        Id     int IDENTITY(1,1) NOT NULL,
+        [Level] nvarchar(50) NOT NULL,
+        Amount  decimal(19,4) NOT NULL
+    );
+END;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE [type]='PK' AND [name]='PK_PO_DoA_Indirect')
+    ALTER TABLE dbo.PO_DelegationOfAuthority_Indirect_Expense ADD CONSTRAINT PK_PO_DoA_Indirect PRIMARY KEY CLUSTERED (Id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE [name]='UX_PO_DoA_Indirect_Level')
+    CREATE UNIQUE INDEX UX_PO_DoA_Indirect_Level ON dbo.PO_DelegationOfAuthority_Indirect_Expense ([Level]);
+GO
+
+/* =========================
+   TABLE: dbo.PO_Stg_Header (staging)
+   ========================= */
+IF OBJECT_ID('dbo.PO_Stg_Header','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_Stg_Header (
+        PoNumber         nvarchar(20) NULL,
+        PoDate           date NULL,
+        VendorNumber     nvarchar(20) NULL,
+        VendorName       nvarchar(80) NULL,
+        VendorAddr1      nvarchar(80) NULL,
+        VendorAddr2      nvarchar(80) NULL,
+        VendorAddr3      nvarchar(80) NULL,
+        VendorState      nvarchar(20) NULL,
+        VendorPostalCode nvarchar(20) NULL,
+        BuyerCode        nvarchar(10) NULL,
+        BuyerName        nvarchar(60) NULL,
+        HouseCode        nvarchar(10) NULL,
+        DirectAmount     decimal(18,2) NULL,
+        IndirectAmount   decimal(18,2) NULL,
+        CreatedAtUtc     datetime2(0) NULL
+    );
+END;
+GO
+
+/* =========================
+   TABLE: dbo.PO_Stg_Line (staging)
+   ========================= */
+IF OBJECT_ID('dbo.PO_Stg_Line','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.PO_Stg_Line (
+        PoNumber            nvarchar(20) NULL,
+        LineNumber          int NULL,
+        HouseCode           nvarchar(10) NULL,
+        ItemNumber          nvarchar(40) NULL,
+        ItemDescription     nvarchar(120) NULL,
+        ItemShortDescription nvarchar(60) NULL,
+        QuantityOrdered     decimal(18,4) NULL,
+        OrderUom            nvarchar(12) NULL,
+        UnitCost            decimal(18,4) NULL,
+        ExtendedCost        decimal(18,4) NULL,
+        RequiredDate        date NULL,
+        GlAccount           nvarchar(40) NULL,
+        CreatedAtUtc        datetime2(0) NULL
+    );
+END;
+GO
+
+/*===============================================================================
+  PURPOSE:  Store the three policy cut-offs the stage builder relies on so that
+            when Finance adjusts Delegation of Authority (DoA) ladders, we avoid
+            editing code.
+
+  TABLE:    dbo.PO_ApprovalPolicy
+
+  WHAT THESE VALUES MEAN
+  ----------------------
+  1) IndirectSplitAt
+     - Pivot for INDIRECT approvals.
+       * If IndAmt < IndirectSplitAt:
+           include all INDIRECT tiers strictly below this split (stop before it).
+       * If IndAmt >= IndirectSplitAt:
+           include all INDIRECT tiers at/above this split up to the tier <= IndAmt.
+
+  2) DirectMinAt
+     - Minimum DIRECT amount for any direct approval to apply.
+       * If DirAmt < DirectMinAt: no DIRECT stages.
+       * If DirAmt >= DirectMinAt: evaluate direct tiers.
+
+  3) DirectStartAt
+     - First DIRECT tier to include (skips Buyer at 50k on purpose).
+       * For DirAmt >= DirectMinAt, include all DIRECT tiers from DirectStartAt
+         up to the ceiling for DirAmt.
+
+  WHEN DO THESE CHANGE?
+  ---------------------
+  - Most DoA changes (adding/removing tiers or changing tier amounts/levels) happen
+    in the DoA tables themselves and DO NOT require changing these three cut-offs.
+  - Change these only when Finance moves a policy "gate", e.g.:
+      * IndirectSplitAt moves (e.g., 2k → 5k).
+      * DirectMinAt moves (e.g., 50k → 75k).
+      * DirectStartAt moves (e.g., LPM begins at 120k instead of 100k).
+
+  WHAT TO DO WHEN FINANCE CHANGES DoA AMOUNTS
+  -------------------------------------------
+  1) If Finance ONLY updates the DoA ladders (rows/levels in DoA tables):
+     - Load the new ladder rows into:
+         dbo.PO_DelegationOfAuthority_Indirect_Expense
+         dbo.PO_DelegationOfAuthority_Direct_Material
+     - No change to this policy table unless a gate moved.
+
+  2) If Finance moves a gate (split/min/start):
+     - Insert a NEW policy row here with the new values and mark it IsActive = 1.
+     - Set the previous active row to IsActive = 0 (kept for audit).
+     - The stage builder procedure will read the single active row and reflect the change
+       without code edits or redeploys.
+
+  ENFORCEMENT
+  -----------
+  - A filtered unique index guarantees exactly one active policy row (IsActive = 1).
+  - CHECK constraints ensure sensible relationships:
+      * IndirectSplitAt >= 0
+      * DirectMinAt     >= 0
+      * DirectStartAt   >= DirectMinAt
+
+  EXTENSION
+  ------------------
+  - If later we need per-HouseCode or per-BuyerCode gates, add those columns
+    (nullable) and change the unique filtered index to include them still keeping
+    one active policy per scope.
+
+===============================================================================*/
+
+IF OBJECT_ID(N'dbo.PO_ApprovalPolicy', N'U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PO_ApprovalPolicy
+  (
+    PolicyId         int            IDENTITY(1,1) NOT NULL
+      CONSTRAINT PK_PO_ApprovalPolicy PRIMARY KEY,
+    -- Scope columns reserved for future use; keep NULLs for a global policy
+    HouseCode        nvarchar(10)   NULL,
+    BuyerCode        nvarchar(10)   NULL,
+
+    -- Three gate values used by the stage builder
+    IndirectSplitAt  decimal(19,4)  NOT NULL,  -- e.g., 2000.0000
+    DirectMinAt      decimal(19,4)  NOT NULL,  -- e.g., 50000.0000
+    DirectStartAt    decimal(19,4)  NOT NULL,  -- e.g., 100000.0000
+
+    -- Row state & audit
+    IsActive         bit            NOT NULL CONSTRAINT DF_PO_ApprovalPolicy_IsActive DEFAULT(1),
+    EffectiveDate    date           NOT NULL CONSTRAINT DF_PO_ApprovalPolicy_EffectiveDate DEFAULT (CONVERT(date, SYSUTCDATETIME())),
+    UpdatedBy        nvarchar(100)  NOT NULL CONSTRAINT DF_PO_ApprovalPolicy_UpdatedBy DEFAULT (SUSER_SNAME()),
+    UpdatedAtUtc     datetime2(0)   NOT NULL CONSTRAINT DF_PO_ApprovalPolicy_UpdatedAtUtc DEFAULT (SYSUTCDATETIME()),
+    Notes            nvarchar(400)  NULL,
+
+    -- Basic sanity checks
+    CONSTRAINT CK_PO_ApprovalPolicy_IndirectSplitAt_Positive CHECK (IndirectSplitAt >= 0),
+    CONSTRAINT CK_PO_ApprovalPolicy_DirectMinAt_Positive     CHECK (DirectMinAt     >= 0),
+    CONSTRAINT CK_PO_ApprovalPolicy_DirectStart_GTE_Min      CHECK (DirectStartAt   >= DirectMinAt)
+  );
+
+  -- Ensure only one active policy (globally). If we later scope by House/Buyer,
+  -- replace this with a composite filtered unique index per scope.
+  CREATE UNIQUE INDEX UX_PO_ApprovalPolicy_OneActive
+    ON dbo.PO_ApprovalPolicy (IsActive)
+    WHERE IsActive = 1;
+END
+GO
+
+-- Active headers (waiting + active only)
+CREATE OR ALTER VIEW dbo.vw_PO_Header_WaitingActive
+AS
+SELECT
+  h.PoNumber,
+  h.PoDate,
+  h.VendorName,
+  h.BuyerName,
+  h.HouseCode,
+  h.DirectAmount,
+  h.IndirectAmount,
+  (ISNULL(h.DirectAmount,0)+ISNULL(h.IndirectAmount,0)) AS TotalAmount,
+  h.Status,          -- 'W','A','D' (but filtered to 'W')
+  h.IsActive,        -- 1 (filtered)
+  h.CreatedAtUtc,
+  (SELECT COUNT(*) FROM dbo.PO_Line l WHERE l.PoNumber = h.PoNumber AND l.IsActive = 1) AS ActiveLineCount
+FROM dbo.PO_Header h
+WHERE h.Status = 'W' AND h.IsActive = 1;
+GO
+
+-- Active lines (for detail page)
+CREATE OR ALTER VIEW dbo.vw_PO_Line_Active
+AS
+SELECT
+  l.PoNumber,
+  l.LineNumber,
+  l.ItemNumber,
+  l.ItemDescription,
+  l.ItemShortDescription as 'SpecialDescription',
+  l.QuantityOrdered,
+  l.OrderUom,
+  l.UnitCost,
+  l.ExtendedCost,
+  l.RequiredDate,
+  l.GlAccount,
+  l.IsActive -- 1 (filtered)
+FROM dbo.PO_Line l
+WHERE l.IsActive = 1;
+GO
+
+/* =========================
+   Done
+   ========================= */
+PRINT 'PO approvals tables and views deployment complete.';
+
+USE [WebappsDev]
+GO
+
+/****** Object:  StoredProcedure [dbo].[PO_Merge]    Script Date: 10/26/2025 9:21:26 AM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE   PROCEDURE [dbo].[PO_Merge]
+AS
+BEGIN
+  /* ============================================================
+     Purpose
+     -------
+     - Transactionally upsert (newest-wins) PO headers and lines
+       from staging into operational tables.
+     - Maintain soft-deletes for items missing from the current
+       waiting snapshot.
+     - Emit one outbox event per PO when newly waiting or reactivated.
+     - Always clear staging after merge.
+     Key behavior:
+       * Newest-wins via CreatedAtUtc.
+       * Soft-deletes only for headers with Status='W'.
+       * Event type: PO_NEW_WAITING; dedupe against unprocessed rows.
+     ============================================================ */
+
+  SET NOCOUNT ON;
+  SET XACT_ABORT ON;
+
+  DECLARE @err nvarchar(4000) = NULL;
+
+  BEGIN TRY
+    BEGIN TRAN;
+
+    /* ========================= HEADER MERGE (newest-wins) ========================= */
+    DECLARE @HdrChanges TABLE
+    (
+      PoNumber     nvarchar(20),
+      Action       nvarchar(10),  -- 'INSERT' / 'UPDATE'
+      WasActive    bit,           -- prior IsActive (deleted)
+      IsActiveNow  bit            -- new IsActive (inserted)
+    );
+
+    ;WITH H AS (
+      SELECT *
+      FROM (
+        SELECT
+          PoNumber, PoDate, VendorNumber, VendorName, VendorAddr1, VendorAddr2, VendorAddr3,
+          VendorState, VendorPostalCode, BuyerCode, BuyerName, HouseCode,
+          DirectAmount, IndirectAmount, CreatedAtUtc,
+          ROW_NUMBER() OVER (PARTITION BY PoNumber ORDER BY CreatedAtUtc DESC) rn
+        FROM dbo.PO_Stg_Header
+        WHERE PoNumber IS NOT NULL
+      ) x
+      WHERE rn = 1
+    )
+    MERGE dbo.PO_Header AS tgt
+    USING H AS src
+      ON tgt.PoNumber = src.PoNumber
+    WHEN MATCHED THEN
+      UPDATE SET
+         PoDate             = src.PoDate,
+         VendorNumber       = COALESCE(src.VendorNumber, tgt.VendorNumber),
+         VendorName         = src.VendorName,
+         VendorAddr1        = src.VendorAddr1,
+         VendorAddr2        = src.VendorAddr2,
+         VendorAddr3        = src.VendorAddr3,
+         VendorState        = src.VendorState,
+         VendorPostalCode   = src.VendorPostalCode,
+         BuyerCode          = src.BuyerCode,
+         BuyerName          = src.BuyerName,
+         HouseCode          = src.HouseCode,
+         DirectAmount       = src.DirectAmount,
+         IndirectAmount     = src.IndirectAmount,
+         CreatedAtUtc       = src.CreatedAtUtc,
+         IsActive           = 1,
+         DeactivatedAtUtc   = NULL,
+         DeactivatedBy      = NULL,
+         DeactivationReason = NULL
+    WHEN NOT MATCHED BY TARGET THEN
+      INSERT (
+        PoNumber, PoDate, VendorNumber, VendorName, VendorAddr1, VendorAddr2, VendorAddr3,
+        VendorState, VendorPostalCode, BuyerCode, BuyerName, HouseCode,
+        DirectAmount, IndirectAmount, CreatedAtUtc, IsActive, [Status]
+      )
+      VALUES (
+        src.PoNumber, src.PoDate, src.VendorNumber, src.VendorName, src.VendorAddr1, src.VendorAddr2, src.VendorAddr3,
+        src.VendorState, src.VendorPostalCode, src.BuyerCode, src.BuyerName, src.HouseCode,
+        src.DirectAmount, src.IndirectAmount, src.CreatedAtUtc, 1, 'W'
+      )
+    WHEN NOT MATCHED BY SOURCE AND tgt.[Status] = 'W' THEN
+      UPDATE SET
+        IsActive           = 0,
+        DeactivatedAtUtc   = SYSUTCDATETIME(),
+        DeactivatedBy      = 'PO_Merge',
+        DeactivationReason = 'Header absent from PRMS waiting snapshot'
+    OUTPUT
+      inserted.PoNumber,
+      $action,
+      CAST(COALESCE(deleted.IsActive, 0) AS bit),
+      CAST(inserted.IsActive AS bit)
+    INTO @HdrChanges(PoNumber, Action, WasActive, IsActiveNow)
+    ;
+
+    /* ========================= LINE MERGE (newest-wins) + FK ========================= */
+    ;WITH L AS (
+      SELECT *
+      FROM (
+        SELECT
+          PoNumber, LineNumber, HouseCode, ItemNumber, ItemDescription, ItemShortDescription,
+          QuantityOrdered, OrderUom, UnitCost, ExtendedCost, RequiredDate, GlAccount, CreatedAtUtc,
+          ROW_NUMBER() OVER (PARTITION BY PoNumber, LineNumber ORDER BY CreatedAtUtc DESC) rn
+        FROM dbo.PO_Stg_Line
+        WHERE PoNumber IS NOT NULL AND LineNumber IS NOT NULL
+      ) x
+      WHERE rn = 1
+    ),
+    LS AS (
+      SELECT
+        L.*,
+        H.PoHeaderId AS PoHeaderIdFk
+      FROM L
+      JOIN dbo.PO_Header H ON H.PoNumber = L.PoNumber
+    )
+    MERGE dbo.PO_Line AS tgt
+    USING LS AS src
+      ON tgt.PoNumber = src.PoNumber
+     AND tgt.LineNumber = src.LineNumber
+    WHEN MATCHED THEN
+      UPDATE SET
+         PoHeaderId           = COALESCE(tgt.PoHeaderId, src.PoHeaderIdFk),
+         HouseCode            = src.HouseCode,
+         ItemNumber           = src.ItemNumber,
+         ItemDescription      = src.ItemDescription,
+         ItemShortDescription = src.ItemShortDescription,
+         QuantityOrdered      = src.QuantityOrdered,
+         OrderUom             = src.OrderUom,
+         UnitCost             = src.UnitCost,
+         ExtendedCost         = src.ExtendedCost,
+         RequiredDate         = src.RequiredDate,
+         GlAccount            = src.GlAccount,
+         IsActive             = 1,
+         DeactivatedAtUtc     = NULL,
+         DeactivatedBy        = NULL,
+         DeactivationReason   = NULL
+    WHEN NOT MATCHED BY TARGET THEN
+      INSERT (
+        PoHeaderId, PoNumber, LineNumber, HouseCode, ItemNumber, ItemDescription, ItemShortDescription,
+        QuantityOrdered, OrderUom, UnitCost, ExtendedCost, RequiredDate, GlAccount, IsActive
+      )
+      VALUES (
+        src.PoHeaderIdFk, src.PoNumber, src.LineNumber, src.HouseCode, src.ItemNumber, src.ItemDescription, src.ItemShortDescription,
+        src.QuantityOrdered, src.OrderUom, src.UnitCost, src.ExtendedCost, src.RequiredDate, src.GlAccount, 1
+      )
+    WHEN NOT MATCHED BY SOURCE
+         AND EXISTS (SELECT 1 FROM dbo.PO_Header h2 WHERE h2.PoNumber = tgt.PoNumber AND h2.[Status] = 'W')
+    THEN
+      UPDATE SET
+        IsActive           = 0,
+        DeactivatedAtUtc   = SYSUTCDATETIME(),
+        DeactivatedBy      = 'PO_Merge',
+        DeactivationReason = 'Line absent from PRMS waiting snapshot'
+    ;
+
+    /* ========================= Cascade soft-delete ========================= */
+    UPDATE Ln
+      SET IsActive            = 0,
+          DeactivatedAtUtc    = COALESCE(Ln.DeactivatedAtUtc, SYSUTCDATETIME()),
+          DeactivatedBy       = COALESCE(Ln.DeactivatedBy, 'PO_Merge'),
+          DeactivationReason  = COALESCE(Ln.DeactivationReason, 'Header soft-deleted')
+    FROM dbo.PO_Line Ln
+    JOIN dbo.PO_Header H
+      ON H.PoNumber = Ln.PoNumber
+    WHERE H.IsActive = 0 AND Ln.IsActive = 1;
+
+    /* ========================= OUTBOX EMISSION =========================
+       - Emits PO_NEW_WAITING for INSERTs or reactivations where Status='W'.
+       - Payload: header summary + total active line count.
+       - Columns DirectAmount / IndirectAmount set on the row.
+       - Dedupe: skip if an unprocessed identical event exists.
+    ======================================================================== */
+    ;WITH H2 AS (
+      SELECT h.*
+      FROM @HdrChanges hc
+      JOIN dbo.PO_Header h ON h.PoNumber = hc.PoNumber
+      WHERE (hc.Action = 'INSERT' OR (hc.WasActive = 0 AND hc.IsActiveNow = 1))
+        AND h.[Status] = 'W'
+    ),
+    P AS (
+      SELECT
+        H2.PoNumber,
+        (SELECT COUNT(*) FROM dbo.PO_Line l WHERE l.PoNumber = H2.PoNumber AND l.IsActive = 1) AS LineCount,
+        (SELECT
+            H2.PoNumber       AS poNumber,
+            H2.PoDate         AS poDate,
+            H2.VendorNumber   AS vendorNumber,
+            H2.VendorName     AS vendorName,
+            H2.BuyerCode      AS buyerCode,
+            H2.BuyerName      AS buyerName,
+            H2.HouseCode      AS houseCode,
+            H2.DirectAmount   AS directAmount,
+            H2.IndirectAmount AS indirectAmount,
+            (COALESCE(H2.DirectAmount,0)+COALESCE(H2.IndirectAmount,0)) AS total,
+            1                 AS schemaVersion
+         FOR JSON PATH, WITHOUT_ARRAY_WRAPPER) AS HeaderJson
+      FROM H2
+    )
+    INSERT INTO dbo.PO_ApprovalOutbox
+      (EventType, PoNumber, OccurredAtUtc, DirectAmount, IndirectAmount, PayloadJson)
+    SELECT
+      'PO_NEW_WAITING',
+      H2.PoNumber,
+      SYSUTCDATETIME(),
+      H2.DirectAmount,
+      H2.IndirectAmount,
+      COALESCE(
+        (
+          SELECT
+            JSON_VALUE(P.HeaderJson,'$.poNumber')         AS poNumber,
+            JSON_VALUE(P.HeaderJson,'$.poDate')           AS poDate,
+            JSON_VALUE(P.HeaderJson,'$.vendorNumber')     AS vendorNumber,
+            JSON_VALUE(P.HeaderJson,'$.vendorName')       AS vendorName,
+            JSON_VALUE(P.HeaderJson,'$.buyerCode')        AS buyerCode,
+            JSON_VALUE(P.HeaderJson,'$.buyerName')        AS buyerName,
+            JSON_VALUE(P.HeaderJson,'$.houseCode')        AS houseCode,
+            JSON_VALUE(P.HeaderJson,'$.directAmount')     AS directAmount,
+            JSON_VALUE(P.HeaderJson,'$.indirectAmount')   AS indirectAmount,
+            JSON_VALUE(P.HeaderJson,'$.total')            AS total,
+            JSON_VALUE(P.HeaderJson,'$.schemaVersion')    AS schemaVersion,
+            P.LineCount                                   AS lineCount
+          FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+        ),
+        CONCAT(N'{"poNumber":"', H2.PoNumber, N'","schemaVersion":1}')
+      ) AS PayloadJson
+    FROM H2
+    JOIN P ON P.PoNumber = H2.PoNumber
+    LEFT JOIN dbo.PO_ApprovalOutbox o
+      ON o.EventType = 'PO_NEW_WAITING'
+     AND o.PoNumber = H2.PoNumber
+     AND o.ProcessedAtUtc IS NULL
+    WHERE o.OutboxId IS NULL
+    ;
+
+    COMMIT;
+  END TRY
+  BEGIN CATCH
+    IF XACT_STATE() <> 0 ROLLBACK;
+    SET @err = ERROR_MESSAGE();
+  END CATCH;
+
+  /* ========================= Staging cleanup ========================= */
+  BEGIN TRY
+    TRUNCATE TABLE dbo.PO_Stg_Line;
+    TRUNCATE TABLE dbo.PO_Stg_Header;
+  END TRY
+  BEGIN CATCH
+    BEGIN TRY
+      DELETE FROM dbo.PO_Stg_Line   WITH (TABLOCK);
+      DELETE FROM dbo.PO_Stg_Header WITH (TABLOCK);
+    END TRY
+    BEGIN CATCH
+      SET @err = COALESCE(@err + N'; ', N'') + N'Cleanup failed: ' + ERROR_MESSAGE();
+    END CATCH;
+  END CATCH;
+
+  IF @err IS NOT NULL
+    THROW 51001, @err, 1;
+END
+GO
+
+-- Ensures the TVP used to pass a set of PoNumbers exists (safe to run repeatedly)
+IF TYPE_ID(N'dbo.PoNumberList') IS NULL
+BEGIN
+  EXEC(N'CREATE TYPE dbo.PoNumberList AS TABLE (
+    PoNumber nvarchar(20) NOT NULL PRIMARY KEY
+  );');
+END
+GO
+
+/*==============================================================================
+  Procedure: dbo.PO_BuildApprovalStages
+  Purpose  : Build (or rebuild) the approval stage rows for a set of POs using
+             the current DoA ladders and a small policy table of “gate” values.
+ 
+  Inputs
+  ------
+  @PoNumbers : dbo.PoNumberList (table type; column PoNumber nvarchar(20))
+               The specific PO numbers to build stages for.
+  @Rebuild   : bit
+               0 = merge/update stages in place (preserve prior A/D/S statuses)
+               1 = delete existing stages for these POs and recompute from scratch
+ 
+  Key idea: The PO's Indirect (IndAmt) and Direct (DirAmt) amounts determine the
+  required approval stages by comparing them against the DoA ladders. Some ladder
+  tiers use ".99" ceilings (e.g., 249,999.99) — these are "penny-edge tiers" in
+  the ladder definition. We compare the PO amount to the tier thresholds and apply 
+  the rules below.
+ 
+  Policy gates (from dbo.PO_ApprovalPolicy):
+    - IndirectSplitAt (e.g., 2,000.00)
+    - DirectMinAt     (e.g., 50,000.00)
+    - DirectStartAt   (e.g., 100,000.00)
+ 
+  Indirect (I):
+    1) If IndAmt = 0 → no indirect stages.
+    2) If IndAmt < IndirectSplitAt:
+         Include every tier with Amount < IndirectSplitAt AND Amount ≤ IndAmt.
+         (Only "sub-pivot" operational roles, capped by the PO amount.)
+    3) If IndAmt ≥ IndirectSplitAt:
+         - Always include all four sub-pivot tiers (Amount < IndirectSplitAt).
+         - Also include tiers with Amount between IndirectSplitAt and IndAmt (inclusive).
+         - Single-tier promotion:
+             If IndAmt is exactly $0.01 below the next tier, include that next tier too.
+             Additionally, per business rule, when IndAmt ≥ 135,000.00 we also include
+             exactly one next tier above the amount (even if not a penny-edge).
+ 
+  Direct (D):
+    1) If DirAmt < DirectMinAt → no direct stages (Buyer tier is intentionally excluded).
+    2) If DirAmt ≥ DirectMinAt:
+         - Compute ceiling = smallest ladder Amount ≥ DirAmt
+           (or max tier if DirAmt exceeds the ladder).
+         - Include all tiers with Amount BETWEEN DirectStartAt AND ceiling (inclusive).
+           (e.g., 100k is ≤249,999.99 yields LPM + FC; ≥250k adds Plant Manager, etc.)
+         - Single-tier promotion:
+             If DirAmt is exactly $0.01 below the next tier, include that next tier too.
+ 
+  De-dupe & ordering:
+    - If a RoleCode is required by both ladders, emit it once with Category = NULL ("both").
+    - Order Indirect group first, then Direct; within each group order by tier Amount then RoleCode.
+    - Assign Sequence = 1..N in that order.
+ 
+  Container & idempotency:
+    - Seed PO_ApprovalChain with Status='P' if missing.
+    - @Rebuild=0 preserves existing A/D/S statuses; @Rebuild=1 deletes/rebuilds stages.
+ 
+    - Penny-edges (e.g., 249,999.99; 1,999,999.99; 499,999.99) are tier boundaries.
+      We compute inclusion using "≤ amount" up to a ceiling tier and, when the PO is
+      exactly $0.01 below the next tier, we promote a single tier to avoid off-by-one
+      misses at those boundaries. The PO amount can be anywhere between tiers; the
+      comparison + promotion rule ensures the correct set of approvers.
+  
+  Terminology & Data Model (for PO Approval Stage Building)
+  ------------------------------------------------------------------------------
+  Terms
+  -----
+  - Gate
+      A required approval checkpoint. Each gate corresponds to an approver role
+      (e.g., "Local Purchasing Manager"). Stages are ordered gates.
+ 
+  - Tier
+      A row in a Delegation-of-Authority (DoA) ladder that pairs an amount with
+      a role (e.g., 100,000.00 → "Local Purchasing Manager"). Tiers define which
+      roles are eligible at/above given amounts.
+ 
+  - Threshold
+      A numeric cutoff used to decide inclusion of tiers (e.g., "include tiers
+      up to the ceiling amount"). Thresholds come from the DoA tables.
+ 
+  - Pivot (Indirect ladder only)
+      The specific Indirect amount at which the rule changes behavior. Below the
+      pivot, only "sub-pivot" operational tiers are considered; at/above the
+      pivot, both the sub-pivot set and the pivot-and-above tiers are considered.
+      This value is configurable in PO_ApprovalPolicy (IndirectSplitAt).
+ 
+  - Ceiling
+      The smallest tier amount in a ladder that is ≥ the PO's amount
+      (or the ladder's maximum when the PO exceeds all tiers). We include tiers
+      up to and including this ceiling.
+ 
+  - Penny-edge
+      A DoA modeling convention where a tier's upper bound is expressed with
+      a ".99" (e.g., 249,999.99). The procedure treats amounts that are one cent
+      below the next tier as if they "belong" to the next tier when the policy
+      requires promotion (e.g., Direct >= 100k; Indirect >= pivot and other
+      site-approved promotion rules). This ensures consistent behavior at
+      boundaries without code edits when Finance adjusts tiers.
+ 
+  ------------------------------------------------------------------------------
+  Database tables & their roles
+  --------------------
+  - PO_ApprovalChain
+      One row per PO. The "container" that records the overall chain status
+      (e.g., Pending/Approved/Declined) and timestamps. Created when a PO first
+      enters the approval workflow.
+ 
+  - PO_ApprovalStage
+      One row per approval gate (sequence) for a PO. Holds the ordered list of
+      roles to approve, an optional category (I=Indirect, D=Direct, NULL=both),
+      and the resolved approver (ApproverUserId) looked up from the directory.
+ 
+  - PO_ApproverDirectory (this is a reference or look-up table)
+      Directory of who fills each role, optionally scoped by HouseCode and
+      BuyerCode. Resolution precedence:
+        (Role, House, Buyer) → (Role, House, '') → (Role, 'GLOBAL', '').
+      Update this table when personnel or routing rules change.
+ 
+  - PO_ApprovalPolicy
+      Small configuration or policy settings that control stage inclusion logic
+      without changing code:
+        * IndirectSplitAt : Indirect pivot (e.g., 2,000.00)
+        * DirectMinAt     : Minimum Direct amount to consider (e.g., 50,000.00)
+        * DirectStartAt   : First Direct tier to include (e.g., 100,000.00), which
+                            intentionally skips the Buyer tier.
+ 
+  ------------------------------------------------------------------------------
+  How it fits together
+  --------------------
+  1) Policy values from PO_ApprovalPolicy define the pivot/min/start thresholds.
+  2) The PO's Indirect/Direct amounts are compared to the respective DoA tiers
+     to compute:
+       - Indirect: sub-pivot set (always bounded) and, when at/above pivot,
+         the pivot-and-above tiers up to the ceiling; apply single-tier promotion
+         at policy boundaries (including penny-edge conditions).
+       - Direct: include tiers from DirectStartAt up to the ceiling; apply
+         single-tier promotion (including penny-edge conditions); Buyer is
+         intentionally excluded even when DirectMinAt is met.
+  3) If a role is required by both ladders, a single stage is emitted with
+     Category = NULL to denote "applies to both".
+  4) Approver identity is resolved via PO_ApproverDirectory using the precedence
+     noted above; GLOBAL acts as a safe fallback default.
+
+  @Rebuild parameter (bit)
+  ------------------------------------------------------------------------------
+	Purpose:
+		Controls how the procedure treats existing rows in PO_ApprovalStage
+		for the supplied @PoNumbers scope.
+
+	Behavior:
+		- @Rebuild = 0  (default; non-destructive refresh)
+			* Keeps any prior per-stage decisions already taken:
+				PO_ApprovalStage.[Status] IN ('A','D','S') are preserved.
+			* Recomputes the list of stages (roles), the resolved approver
+			identities, and the ordering/sequence.
+			* Uses MERGE to upsert stages without clearing existing rows; only
+			adds/updates/deletes stages that differ from the newly computed set.
+			* Does NOT change PO_ApprovalChain.[Status]; it only seeds a 'P' row
+			if the chain is missing.
+
+		- @Rebuild = 1  (hard rebuild)
+			* Deletes all PO_ApprovalStage rows for @PoNumbers first, then
+			recomputes the entire set of stages from scratch.
+			* Previously recorded per-stage decisions are not retained.
+			* Use when policy thresholds changed materially (or ladders/roles
+			were corrected) and you want a clean re-evaluation.
+
+	Guidance:
+		- Prefer @Rebuild = 0 during normal ingestion runs to maintain audit
+		integrity of prior approvals/denials/suspensions.
+		- Use @Rebuild = 1 only for intentional resets (e.g., policy change,
+		test data resets, etc.)
+
+	Idempotency:
+		- With @Rebuild = 0, the procedure is idempotent (safe to run repeatedly): 
+		re-executing for the same @PoNumbers yields the same stage set and preserves 
+		A/D/S statuses.
+==============================================================================*/
+CREATE OR ALTER PROCEDURE dbo.PO_BuildApprovalStages
+  @PoNumbers dbo.PoNumberList READONLY,
+  @Rebuild   bit = 0
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SET XACT_ABORT ON;
+ 
+  BEGIN TRAN;
+ 
+  /* 1) Load active policy (must exist) */
+  ;WITH ActivePolicy AS (
+    SELECT TOP (1)
+           IndirectSplitAt,
+           DirectMinAt,
+           DirectStartAt
+    FROM dbo.PO_ApprovalPolicy
+    WHERE IsActive = 1
+    ORDER BY EffectiveDate DESC, UpdatedAtUtc DESC
+  )
+  SELECT * INTO #AP FROM ActivePolicy;
+ 
+  IF NOT EXISTS (SELECT 1 FROM #AP)
+  BEGIN
+    ROLLBACK;
+    THROW 52001, 'PO_BuildApprovalStages: No active row in dbo.PO_ApprovalPolicy.', 1;
+  END
+ 
+  /* 2) Ensure chain container exists */
+  INSERT INTO dbo.PO_ApprovalChain (PoNumber, CreatedAtUtc, [Status], FinalizedAtUtc)
+  SELECT H.PoNumber, SYSUTCDATETIME(), 'P', NULL
+  FROM dbo.PO_Header H
+  JOIN @PoNumbers P ON P.PoNumber = H.PoNumber
+  LEFT JOIN dbo.PO_ApprovalChain C ON C.PoNumber = H.PoNumber
+  WHERE C.PoNumber IS NULL;
+ 
+  /* 3) Optional hard rebuild */
+  IF @Rebuild = 1
+  BEGIN
+    DELETE S
+    FROM dbo.PO_ApprovalStage S
+    JOIN @PoNumbers P ON P.PoNumber = S.PoNumber;
+  END
+ 
+  /* 4) Scratch */
+  IF OBJECT_ID('tempdb..#Build') IS NOT NULL DROP TABLE #Build;
+  CREATE TABLE #Build(
+    PoNumber       nvarchar(20)  NOT NULL,
+    RoleCode       nvarchar(50)  NOT NULL,
+    Category       char(1)       NULL,  -- 'I','D', or NULL (both)
+    ThresholdAmt   decimal(19,4) NULL,
+    ApproverUserId nvarchar(100) NULL
+  );
+ 
+  /* 5) Scope rows */
+  ;WITH ScopePO AS (
+    SELECT H.PoNumber,
+           H.HouseCode,
+           COALESCE(NULLIF(H.BuyerCode,''), N'') AS BuyerCode,
+           COALESCE(H.IndirectAmount, 0) AS IndAmt,
+           COALESCE(H.DirectAmount,   0) AS DirAmt
+    FROM dbo.PO_Header H
+    JOIN @PoNumbers P ON P.PoNumber = H.PoNumber
+    WHERE H.IsActive = 1 AND H.[Status] = 'W'
+  ),
+ 
+  /* =========================
+     INDIRECT (pivot + ceiling + single-tier promotion rule)
+     ========================= */
+  I_Params AS (
+    SELECT AP.IndirectSplitAt AS PivotAmt FROM #AP AP
+  ),
+  -- Base sub-pivot inclusion
+  I_Low AS (
+    SELECT S.PoNumber, D.[Level] AS RoleCode, CAST('I' AS char(1)) AS Category, D.Amount AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN I_Params IP
+    JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense D
+      ON D.Amount < IP.PivotAmt
+     AND (
+           (S.IndAmt <  IP.PivotAmt AND D.Amount <= S.IndAmt)
+        OR (S.IndAmt >= IP.PivotAmt)  -- include all four when ≥ pivot
+         )
+    WHERE S.IndAmt > 0
+  ),
+  -- Pivot..≤IndAmt inclusion when at/above pivot
+  I_Main AS (
+    SELECT S.PoNumber, D.[Level] AS RoleCode, CAST('I' AS char(1)) AS Category, D.Amount AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN I_Params IP
+    JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense D
+      ON S.IndAmt >= IP.PivotAmt
+     AND D.Amount BETWEEN IP.PivotAmt AND S.IndAmt
+  ),
+  -- Single-tier promotion (only when IndAmt ≥ 135k OR penny-edge)
+  I_Promote AS (
+    SELECT S.PoNumber,
+           DN.[Level]           AS RoleCode,
+           CAST('I' AS char(1)) AS Category,
+           DN.Amount            AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN I_Params IP
+    OUTER APPLY (
+      SELECT MIN(Amount) AS NextAmt
+      FROM dbo.PO_DelegationOfAuthority_Indirect_Expense
+      WHERE Amount > S.IndAmt
+    ) NX
+    JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense DN
+      ON DN.Amount = NX.NextAmt
+    WHERE S.IndAmt >= IP.PivotAmt
+      AND NX.NextAmt IS NOT NULL
+      AND (
+            CONVERT(decimal(19,2), NX.NextAmt - S.IndAmt) = 0.01
+         OR S.IndAmt >= 135000.00
+          )
+  ),
+  -- *** Always include IP CFO when 2k <= IndAmt < 135k ***
+  I_CFOBoost AS (
+    SELECT S.PoNumber,
+           D.[Level]            AS RoleCode,     -- 'IP CFO' at Amount = 135000.00
+           CAST('I' AS char(1)) AS Category,
+           D.Amount             AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN I_Params IP
+    JOIN dbo.PO_DelegationOfAuthority_Indirect_Expense D
+      ON D.Amount = 135000.00
+    WHERE S.IndAmt >= IP.PivotAmt       -- ≥ 2,000
+      AND S.IndAmt < 135000.00          -- below CFO tier
+  ),
+  I_Ladder AS (
+    SELECT * FROM I_Low
+    UNION ALL
+    SELECT * FROM I_Main
+    UNION ALL
+    SELECT * FROM I_Promote
+    UNION ALL
+    SELECT * FROM I_CFOBoost
+  ),
+ 
+  /* =======================
+     DIRECT (cumulative + single-tier promotion rule; excludes Buyer)
+     ======================= */
+  D_Ceil AS (
+    SELECT S.PoNumber, MIN(D.Amount) AS CeilingAmt
+    FROM ScopePO S
+    CROSS JOIN #AP AP
+    JOIN dbo.PO_DelegationOfAuthority_Direct_Material D
+      ON S.DirAmt >= AP.DirectMinAt
+     AND D.Amount >= S.DirAmt
+    GROUP BY S.PoNumber
+ 
+    UNION ALL
+ 
+    SELECT S.PoNumber, MAX(D.Amount) AS CeilingAmt
+    FROM ScopePO S
+    CROSS JOIN #AP AP
+    JOIN dbo.PO_DelegationOfAuthority_Direct_Material D
+      ON S.DirAmt >= AP.DirectMinAt
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.PO_DelegationOfAuthority_Direct_Material D2 WHERE D2.Amount >= S.DirAmt)
+    GROUP BY S.PoNumber
+  ),
+  -- Base cumulative: DirectStartAt..Ceiling (inclusive)
+  D_Base AS (
+    SELECT S.PoNumber,
+           D.[Level]            AS RoleCode,
+           CAST('D' AS char(1)) AS Category,
+           D.Amount             AS ThresholdAmt
+    FROM ScopePO S
+    JOIN D_Ceil C ON C.PoNumber = S.PoNumber
+    CROSS JOIN #AP AP
+    JOIN dbo.PO_DelegationOfAuthority_Direct_Material D
+      ON D.Amount BETWEEN AP.DirectStartAt AND C.CeilingAmt
+  ),
+  -- Single-tier promotion when DirAmt ≥ DirectStartAt OR penny-edge
+  D_Promote AS (
+    SELECT S.PoNumber,
+           DN.[Level]           AS RoleCode,
+           CAST('D' AS char(1)) AS Category,
+           DN.Amount            AS ThresholdAmt
+    FROM ScopePO S
+    CROSS JOIN #AP AP
+    OUTER APPLY (
+      SELECT MIN(Amount) AS NextAboveCeil
+      FROM dbo.PO_DelegationOfAuthority_Direct_Material
+      WHERE Amount >
+        (
+          SELECT MIN(Amount)
+          FROM dbo.PO_DelegationOfAuthority_Direct_Material
+          WHERE Amount >= S.DirAmt
+        )
+    ) NX
+    JOIN dbo.PO_DelegationOfAuthority_Direct_Material DN
+      ON DN.Amount = NX.NextAboveCeil
+    WHERE S.DirAmt >= AP.DirectMinAt
+      AND NX.NextAboveCeil IS NOT NULL
+      AND (
+            CONVERT(decimal(19,2),
+              (SELECT MIN(Amount) FROM dbo.PO_DelegationOfAuthority_Direct_Material WHERE Amount >= S.DirAmt) - S.DirAmt
+          ) = 0.01
+           OR S.DirAmt >= AP.DirectStartAt
+          )
+  ),
+  D_Ladder AS (
+    SELECT * FROM D_Base
+    UNION ALL
+    SELECT * FROM D_Promote
+  ),
+ 
+  /* ---------- Order & de-dupe ---------- */
+  Ladders AS (
+    SELECT PoNumber, RoleCode, Category, ThresholdAmt,
+           ROW_NUMBER() OVER (PARTITION BY PoNumber, Category
+                              ORDER BY ThresholdAmt ASC, RoleCode) AS OrdInCat,
+           CASE WHEN Category = 'I' THEN 1 ELSE 2 END AS CatOrder
+    FROM (
+      SELECT * FROM I_Ladder
+      UNION ALL
+      SELECT * FROM D_Ladder
+    ) X
+  ),
+  OrderedUnion AS (
+    SELECT L.PoNumber, L.RoleCode, L.Category, L.ThresholdAmt,
+           ROW_NUMBER() OVER (
+             PARTITION BY L.PoNumber, L.RoleCode
+             ORDER BY L.CatOrder, L.OrdInCat
+           ) AS KeepOne
+    FROM Ladders L
+  ),
+  Kept AS (
+    SELECT K.PoNumber,
+           K.RoleCode,
+           CASE
+             WHEN EXISTS (
+               SELECT 1
+               FROM Ladders L2
+               WHERE L2.PoNumber = K.PoNumber
+                 AND L2.RoleCode = K.RoleCode
+                 AND L2.Category <> K.Category
+             ) THEN NULL
+             ELSE K.Category
+           END AS Category,
+           K.ThresholdAmt
+    FROM OrderedUnion K
+    WHERE K.KeepOne = 1
+  ),
+  ResolvedApprover AS (
+    SELECT K.PoNumber, K.RoleCode, K.Category, K.ThresholdAmt,
+           COALESCE(D1.UserId, D2.UserId, D3.UserId) AS ApproverUserId
+    FROM Kept K
+    JOIN ScopePO S ON S.PoNumber = K.PoNumber
+    OUTER APPLY (
+      SELECT TOP (1) * FROM dbo.PO_ApproverDirectory
+      WHERE IsActive = 1
+        AND RoleCode = K.RoleCode
+        AND HouseCode = S.HouseCode
+        AND BuyerCode = S.BuyerCode
+      ORDER BY UpdatedAtUtc DESC
+    ) D1
+    OUTER APPLY (
+      SELECT TOP (1) * FROM dbo.PO_ApproverDirectory
+      WHERE IsActive = 1
+        AND RoleCode = K.RoleCode
+        AND HouseCode = S.HouseCode
+        AND BuyerCode = N''
+      ORDER BY UpdatedAtUtc DESC
+    ) D2
+    OUTER APPLY (
+      SELECT TOP (1) * FROM dbo.PO_ApproverDirectory
+      WHERE IsActive = 1
+        AND RoleCode = K.RoleCode
+        AND HouseCode = N'GLOBAL'
+        AND BuyerCode = N''
+      ORDER BY UpdatedAtUtc DESC
+    ) D3
+  )
+  INSERT INTO #Build (PoNumber, RoleCode, Category, ThresholdAmt, ApproverUserId)
+  SELECT PoNumber, RoleCode, Category, ThresholdAmt, ApproverUserId
+  FROM ResolvedApprover;
+ 
+  /* Final ordering & MERGE */
+  ;WITH SeqBase AS (
+    SELECT B.*,
+           CASE WHEN B.Category = 'I' THEN 1
+                WHEN B.Category = 'D' THEN 2
+                ELSE 1  -- “both” groups with Indirect
+           END AS CatOrder
+    FROM #Build B
+  ),
+  Ordered AS (
+    SELECT PoNumber, RoleCode, Category, ApproverUserId,
+           ROW_NUMBER() OVER (
+             PARTITION BY PoNumber
+             ORDER BY CatOrder, ISNULL(ThresholdAmt,0), RoleCode
+           ) AS Seq
+    FROM SeqBase
+  )
+  MERGE dbo.PO_ApprovalStage AS T
+  USING Ordered AS S
+    ON T.PoNumber  = S.PoNumber
+   AND T.[Sequence] = S.Seq
+  WHEN MATCHED THEN
+    UPDATE SET
+      T.RoleCode       = S.RoleCode,
+      T.ApproverUserId = S.ApproverUserId,
+      T.Category       = S.Category,
+      T.ThresholdFrom  = NULL,
+      T.ThresholdTo    = NULL,
+      T.[Status]       = CASE WHEN T.[Status] IN ('A','D','S') THEN T.[Status] ELSE 'P' END
+  WHEN NOT MATCHED BY TARGET THEN
+    INSERT (PoNumber, [Sequence], RoleCode, ApproverUserId, Category, ThresholdFrom, ThresholdTo, [Status], DecidedAtUtc)
+    VALUES (S.PoNumber, S.Seq, S.RoleCode, S.ApproverUserId, S.Category, NULL, NULL, 'P', NULL)
+  WHEN NOT MATCHED BY SOURCE
+       AND T.PoNumber IN (SELECT PoNumber FROM @PoNumbers)
+  THEN
+    DELETE;
+ 
+  COMMIT;
+END
+GO
+
+-- =============================================================================
+-- Procedure: dbo.PO_IngestAndBuild
+-- Purpose  : Orchestrator that:
+--            1) Executes stored procedure dbo.PO_Merge to upsert headers/lines and
+--               emit PO_NEW_WAITING outbox rows.
+--            2) Collects newly waiting PoNumbers from the outbox snapshot.
+--            3) Builds approval stages for just those POs.
+-- Notes    : Leaves Outbox.ProcessedAtUtc untouched (the async worker owns it).
+-- =============================================================================
+CREATE OR ALTER PROCEDURE dbo.PO_IngestAndBuild
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SET XACT_ABORT ON;
+
+  DECLARE @New dbo.PoNumberList;
+
+  BEGIN TRAN;
+
+  EXEC dbo.PO_Merge;
+
+  INSERT INTO @New(PoNumber)
+  SELECT DISTINCT O.PoNumber
+  FROM dbo.PO_ApprovalOutbox O
+  JOIN dbo.PO_Header H ON H.PoNumber = O.PoNumber
+  WHERE O.EventType = 'PO_NEW_WAITING'
+    AND O.ProcessedAtUtc IS NULL
+    AND H.IsActive = 1
+    AND H.[Status] = 'W';
+
+  COMMIT;
+
+  IF EXISTS (SELECT 1 FROM @New)
+  BEGIN
+    EXEC dbo.PO_BuildApprovalStages @PoNumbers = @New, @Rebuild = 0;
+  END
+END
+GO
+
+-- seed PO_ApproverDirectory for testing
+/* ----- OPTIONAL: a GLOBAL fallback if a house entry is missing ----- */
+IF NOT EXISTS (SELECT 1 FROM dbo.PO_ApproverDirectory WHERE HouseCode='GLOBAL')
+BEGIN
+  INSERT INTO dbo.PO_ApproverDirectory (RoleCode, HouseCode, BuyerCode, UserId, DisplayName, Email) VALUES
+  ('Buyer',                          'GLOBAL','', 'u.buyer.global',        'Buyer (Global)',                         'buyer.global@example.com'),
+  ('Local Purchasing Manager',       'GLOBAL','', 'u.lpm.global',           'Local Purchasing Manager (Global)',      'lpm.global@example.com'),
+  ('Financial Controller',           'GLOBAL','', 'u.fc.global',            'Financial Controller (Global)',          'fc.global@example.com'),
+  ('Plant Manager (General Manager)','GLOBAL','', 'u.gm.global',            'Plant Manager / GM (Global)',            'gm.global@example.com'),
+  ('Regional Supply Chain Manager',  'GLOBAL','', 'u.rscm.global',          'Regional Supply Chain Manager (Global)', 'rscm.global@example.com'),
+  ('IP CFO Direct Reports',          'GLOBAL','', 'u.ipcfo.dr.global',      'IP CFO Direct Reports (Global)',         'ipcfo.dr.global@example.com'),
+  ('Regional VP/GM',                 'GLOBAL','', 'u.rvp.global',           'Regional VP/GM (Global)',                'rvp.global@example.com'),
+  ('IP CFO',                         'GLOBAL','', 'u.ipcfo.global',         'IP CFO (Global)',                        'ipcfo.global@example.com'),
+  ('IP President',                   'GLOBAL','', 'u.ippres.global',        'IP President (Global)',                  'ippres.global@example.com'),
+  ('ITT CFO',                        'GLOBAL','', 'u.ittcfo.global',        'ITT CFO (Global)',                       'ittcfo.global@example.com'),
+  ('ITT CEO',                        'GLOBAL','', 'u.ittceo.global',        'ITT CEO (Global)',                       'ittceo.global@example.com'),
+  ('Cost Center Owner/Supervisor',   'GLOBAL','', 'u.cco.global',           'Cost Center Owner/Supervisor (Global)',  'cco.global@example.com'),
+  ('Local Department Manager',       'GLOBAL','', 'u.ldm.global',           'Local Department Manager (Global)',      'ldm.global@example.com');
+END;
+
+/* ----- Helper to insert the same role set for a specific HouseCode ----- */
+DECLARE @houses TABLE(HouseCode nvarchar(10));
+INSERT INTO @houses(HouseCode) VALUES (N'E0'),(N'E1'),(N'E2'),(N'E4');
+
+;WITH R(RoleCode, UserIdPrefix, DisplayName)
+AS (
+  SELECT 'Buyer',                          'buyer',       'Buyer' UNION ALL
+  SELECT 'Local Purchasing Manager',       'lpm',         'Local Purchasing Manager' UNION ALL
+  SELECT 'Financial Controller',           'fc',          'Financial Controller' UNION ALL
+  SELECT 'Plant Manager (General Manager)','gm',          'Plant Manager / GM' UNION ALL
+  SELECT 'Regional Supply Chain Manager',  'rscm',        'Regional Supply Chain Manager' UNION ALL
+  SELECT 'IP CFO Direct Reports',          'ipcfo.dr',    'IP CFO Direct Reports' UNION ALL
+  SELECT 'Regional VP/GM',                 'rvp',         'Regional VP/GM' UNION ALL
+  SELECT 'IP CFO',                         'ipcfo',       'IP CFO' UNION ALL
+  SELECT 'IP President',                   'ippres',      'IP President' UNION ALL
+  SELECT 'ITT CFO',                        'ittcfo',      'ITT CFO' UNION ALL
+  SELECT 'ITT CEO',                        'ittceo',      'ITT CEO' UNION ALL
+  SELECT 'Cost Center Owner/Supervisor',   'cco',         'Cost Center Owner/Supervisor' UNION ALL
+  SELECT 'Local Department Manager',       'ldm',         'Local Department Manager'
+)
+INSERT INTO dbo.PO_ApproverDirectory (RoleCode, HouseCode, BuyerCode, UserId, DisplayName, Email)
+SELECT
+  R.RoleCode,
+  H.HouseCode,
+  N'',  -- keep BuyerCode blank for now
+  CONCAT('u.', R.UserIdPrefix, '.', LOWER(H.HouseCode)),
+  CONCAT(R.DisplayName, ' (', H.HouseCode, ')'),
+  CONCAT(R.UserIdPrefix, '.', LOWER(H.HouseCode), '@example.com')
+FROM R
+CROSS JOIN @houses H
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM dbo.PO_ApproverDirectory d
+  WHERE d.RoleCode = R.RoleCode
+    AND d.HouseCode = H.HouseCode
+    AND d.BuyerCode = N''
+);
+
+-- seed the policy table with current production assumptions
+/* Seed the current active policy (GLOBAL scope)
+   Current production assumptions:
+     IndirectSplitAt =  2,000.00
+     DirectMinAt     = 50,000.00
+     DirectStartAt   = 100,000.00
+*/
+IF NOT EXISTS (SELECT 1 FROM dbo.PO_ApprovalPolicy WHERE IsActive = 1)
+BEGIN
+  INSERT INTO dbo.PO_ApprovalPolicy
+    (HouseCode, BuyerCode, IndirectSplitAt, DirectMinAt, DirectStartAt, IsActive, Notes)
+  VALUES
+    (NULL, NULL, 2000.0000, 50000.0000, 100000.0000, 1, N'Initial global policy for PO approvals');
+END
+GO
+
+-- (RUN WHEN NEEDED) keep commented until it's necessary to activate a new policy
+/* Example: activating a new policy when Finance moves a gate
+   - Deactivate the current row, insert a new active row with changed values.
+   NOTE: This block is an example; do not run unless you intend to change policy.
+
+-- 1) Deactivate current active
+UPDATE dbo.PO_ApprovalPolicy
+SET IsActive = 0, UpdatedAtUtc = SYSUTCDATETIME(), UpdatedBy = SUSER_SNAME()
+WHERE IsActive = 1;
+
+-- 2) Insert new active with revised gates
+INSERT INTO dbo.PO_ApprovalPolicy
+  (HouseCode, BuyerCode, IndirectSplitAt, DirectMinAt, DirectStartAt, IsActive, Notes)
+VALUES
+  (NULL, NULL, 5000.0000, 75000.0000, 150000.0000, 1, N'Finance update: raise indirect split to 5k; direct min 75k; direct start 150k');
+GO
+*/
+
+import { Component, ViewChild } from '@angular/core';
+import { HttpClient, HttpParams } from '@angular/common/http';
+import { DialogComponent } from '@syncfusion/ej2-angular-popups';
+import {
+  CommandModel,
+  CommandClickEventArgs,
+} from '@syncfusion/ej2-angular-grids';
+import {
+  PoDetailResponse,
+  PoHeaderView,
+  PoLineView,
+  PoListResponse,
+  PoStage,
+} from 'src/app/core/models/poapprovals/poapprovals_models';
+
+@Component({
+  selector: 'app-po-approvals-browser',
+  templateUrl: './po-approvals-browser.component.html',
+  styleUrls: ['./po-approvals-browser.component.css'],
+})
+export class PoApprovalsBrowserComponent {
+  // ────────────────────── Public state (template-bound) ──────────────────────
+  public poRows: PoHeaderView[] = [];
+
+  public detailHeader: PoHeaderView | null = null;
+  public lines: PoLineView[] = [];
+  public stages: PoStage[] = [];
+  public dialogOpen = false;
+
+  // Command column buttons (used by template)
+  public commands: CommandModel[] = [
+    {
+      type: 'None',
+      buttonOption: { content: 'Details', cssClass: 'e-primary cmd-view' },
+    },
+    {
+      type: 'None',
+      buttonOption: {
+        content: 'Documentation',
+        cssClass: 'e-info cmd-docs ml',
+      },
+    },
+  ];
+
+  // Docs dialog state (template reads these)
+  public currentPoForDocs: PoHeaderView | null = null;
+  public notesText: string = '';
+  public selectedFiles: File[] = [];
+
+  // ────────────────────── Private template refs ──────────────────────────────
+  @ViewChild('poDialog', { static: false }) private poDialog?: DialogComponent;
+  @ViewChild('docDialog', { static: false })
+  private docDialog?: DialogComponent;
+
+  // ────────────────────── Construction & lifecycle ───────────────────────────
+  public constructor(private http: HttpClient) {}
+
+  public ngOnInit(): void {
+    const params = new HttpParams().set('page', '1').set('pageSize', '20');
+    this.http.get<PoListResponse>('/api/po', { params }).subscribe((resp) => {
+      const rows = (resp?.rows ?? []).map(this.toHeader);
+      this.poRows = rows;
+    });
+  }
+
+  // ────────────────────── Public handlers: grid / dialogs / inputs ───────────
+  public onCommandClick(args: CommandClickEventArgs): void {
+    const row: any = args.rowData;
+    const target = args.target as HTMLElement | null;
+    const poNumber: string = row?.poNumber ?? row?.PoNumber ?? '';
+
+    if (target?.classList.contains('cmd-view')) {
+      this.loadDetails(poNumber, row);
+      return;
+    }
+    if (target?.classList.contains('cmd-docs')) {
+      this.openDocsForRow(row);
+      return;
+    }
+
+    // Fallback (labels differ from current button text; only used if classes change)
+    const label = (args.commandColumn as any)?.buttonOption?.content as
+      | string
+      | undefined;
+    if (label === 'Details') this.loadDetails(poNumber, row);
+    else if (label === 'Documentation') this.openDocsForRow(row);
+  }
+
+  public onDlgOpen(): void {
+    this.dialogOpen = true;
+    this.freezePageScroll();
+  }
+
+  public onDlgClose(): void {
+    this.dialogOpen = false;
+    this.unfreezePageScroll();
+  }
+
+  public openDocsForRow(row: any): void {
+    this.currentPoForDocs = this.toHeader(row ?? {});
+    this.notesText = '';
+    this.selectedFiles = [];
+    this.docDialog?.show();
+    requestAnimationFrame(() => this.docDialog?.refreshPosition());
+  }
+
+  public onDocDlgOpen(): void {
+    this.onDlgOpen(); // reuse scroll lock
+    this.docDialog?.refreshPosition();
+  }
+
+  public onDocDlgClose(): void {
+    this.onDlgClose(); // reuse scroll unlock
+    this.currentPoForDocs = null;
+    this.notesText = '';
+    this.selectedFiles = [];
+  }
+
+  public onNotesInput(value: string): void {
+    this.notesText = value;
+  }
+
+  public onFilesSelected(args: any): void {
+    const list: File[] = Array.from(
+      (args?.event?.target?.files ?? []) as FileList
+    );
+    this.selectedFiles = list;
+  }
+
+  public removeSelectedFile(idx: number): void {
+    this.selectedFiles.splice(idx, 1);
+    this.selectedFiles = [...this.selectedFiles];
+  }
+
+  public saveNotes(): void {
+    console.log('saveNotes() not implemented', {
+      poNumber: this.currentPoForDocs?.poNumber,
+      notes: this.notesText,
+    });
+    alert('Notes saved (stub). Implement API call.');
+  }
+
+  public uploadSelectedFiles(): void {
+    console.log('uploadSelectedFiles() not implemented', {
+      poNumber: this.currentPoForDocs?.poNumber,
+      files: this.selectedFiles,
+    });
+    alert('Files upload (stub). Implement API call.');
+  }
+
+  public approve(): void {
+    alert('You clicked the Approved button.');
+  }
+  public deny(): void {
+    alert('You clicked the Deny button.');
+  }
+
+  // ────────────────────── Private helpers: mapping & API ─────────────────────
+  private toHeader = (h: any): PoHeaderView => ({
+    poNumber: h.poNumber ?? h.PoNumber ?? '',
+    poDate: h.poDate ?? h.PoDate,
+    vendorName: h.vendorName ?? h.VendorName,
+    buyerName: h.buyerName ?? h.BuyerName,
+    houseCode: h.houseCode ?? h.HouseCode,
+    directAmount: h.directAmount ?? h.DirectAmount ?? 0,
+    indirectAmount: h.indirectAmount ?? h.IndirectAmount ?? 0,
+    totalAmount:
+      h.totalAmount ??
+      h.TotalAmount ??
+      (h.directAmount ?? h.DirectAmount ?? 0) +
+        (h.indirectAmount ?? h.IndirectAmount ?? 0),
+    status: (h.status ?? h.Status ?? 'W') as 'W' | 'A' | 'D',
+    isActive: (h.isActive ?? h.IsActive ?? true) as boolean,
+    createdAtUtc: h.createdAtUtc ?? h.CreatedAtUtc,
+    activeLineCount: h.activeLineCount ?? h.ActiveLineCount ?? 0,
+  });
+
+  private toLine = (l: any): PoLineView => ({
+    poNumber: l.poNumber ?? l.PoNumber ?? '',
+    lineNumber: l.lineNumber ?? l.LineNumber ?? 0,
+    itemNumber: l.itemNumber ?? l.ItemNumber ?? '',
+    itemDescription: l.itemDescription ?? l.ItemDescription,
+    specialDescription: l.specialDescription ?? l.SpecialDescription,
+    quantityOrdered: l.quantityOrdered ?? l.QuantityOrdered,
+    orderUom: l.orderUom ?? l.OrderUom,
+    unitCost: l.unitCost ?? l.UnitCost,
+    extendedCost: l.extendedCost ?? l.ExtendedCost,
+    requiredDate: l.requiredDate ?? l.RequiredDate,
+    glAccount: l.glAccount ?? l.GlAccount,
+    isActive: (l.isActive ?? l.IsActive ?? true) as boolean,
+  });
+
+  private toStage = (s: any): PoStage => ({
+    poNumber: s.poNumber ?? s.PoNumber ?? '',
+    sequence: s.sequence ?? s.Sequence ?? 0,
+    roleCode: s.roleCode ?? s.RoleCode ?? '',
+    approverUserId: s.approverUserId ?? s.ApproverUserId,
+    category: (s.category ?? s.Category ?? null) as 'I' | 'D' | null,
+    thresholdFrom: s.thresholdFrom ?? s.ThresholdFrom,
+    thresholdTo: s.thresholdTo ?? s.ThresholdTo,
+    status: (s.status ?? s.Status ?? 'P') as 'P' | 'A' | 'D' | 'S',
+    decidedAtUtc: s.decidedAtUtc ?? s.DecidedAtUtc,
+  });
+
+  private loadDetails(poNumber: string, fallbackRow?: any): void {
+    if (!poNumber) return;
+    this.http
+      .get<PoDetailResponse>(`/api/po/${encodeURIComponent(poNumber)}`)
+      .subscribe((d) => {
+        this.detailHeader = this.toHeader(d?.header ?? fallbackRow ?? {});
+        this.lines = (d?.lines ?? []).map(this.toLine);
+        this.stages = (d?.stages ?? []).map(this.toStage);
+        this.poDialog?.show();
+      });
+  }
+
+  // ────────────────────── Private: page scroll locking ───────────────────────
+  private scrollY = 0;
+  private bodyStyleBackup: Partial<CSSStyleDeclaration> = {};
+  private lockDepth = 0;
+
+  private freezePageScroll(): void {
+    if (this.lockDepth++ > 0) return;
+    if (typeof window === 'undefined' || typeof document === 'undefined')
+      return;
+
+    this.scrollY = window.scrollY || window.pageYOffset || 0;
+    const b = document.body;
+    this.bodyStyleBackup = {
+      position: b.style.position,
+      overflow: b.style.overflow,
+      width: b.style.width,
+      top: b.style.top,
+      left: b.style.left,
+      right: b.style.right,
+    };
+    b.style.position = 'fixed';
+    b.style.overflow = 'hidden';
+    b.style.width = '100%';
+    b.style.top = `-${this.scrollY}px`;
+    b.style.left = '0';
+    b.style.right = '0';
+  }
+
+  private unfreezePageScroll(): void {
+    if (--this.lockDepth > 0) return;
+    if (typeof window === 'undefined' || typeof document === 'undefined')
+      return;
+
+    const b = document.body;
+    b.style.position = this.bodyStyleBackup.position ?? '';
+    b.style.overflow = this.bodyStyleBackup.overflow ?? '';
+    b.style.width = this.bodyStyleBackup.width ?? '';
+    b.style.top = this.bodyStyleBackup.top ?? '';
+    b.style.left = this.bodyStyleBackup.left ?? '';
+    b.style.right = this.bodyStyleBackup.right ?? '';
+    window.scrollTo(0, this.scrollY);
+  }
+}
+
+<div class="card-container">
+  <h3 class="card-title">PO Approvals</h3>
+  <br />
+
+  <ejs-grid
+    [dataSource]="poRows"
+    [allowPaging]="true"
+    [pageSettings]="{ pageSize: 20, pageSizes: true }"
+    [allowSorting]="true"
+    [allowFiltering]="false"
+    [toolbar]="['Search']"
+    [allowSelection]="false"
+    [allowKeyboard]="false"
+    (commandClick)="onCommandClick($event)"
+  >
+    <e-columns>
+      <!-- Command column: Details + Documentation -->
+      <e-column
+        headerText="Actions"
+        width="240"
+        [commands]="commands"
+        textAlign="Center"
+        headerTextAlign="Center"
+      ></e-column>
+
+      <e-column field="poNumber" headerText="PO #" width="120"></e-column>
+      <e-column
+        field="poDate"
+        headerText="Date"
+        type="date"
+        format="yyyy-MM-dd"
+        width="120"
+      ></e-column>
+      <e-column field="vendorName" headerText="Vendor" width="240"></e-column>
+      <e-column field="buyerName" headerText="Buyer" width="160"></e-column>
+      <e-column field="houseCode" headerText="House" width="90"></e-column>
+
+      <e-column
+        field="directAmount"
+        headerText="Direct"
+        format="C2"
+        textAlign="Right"
+        width="120"
+      ></e-column>
+      <e-column
+        field="indirectAmount"
+        headerText="Indirect"
+        format="C2"
+        textAlign="Right"
+        width="120"
+      ></e-column>
+      <e-column
+        field="activeLineCount"
+        headerText="Lines"
+        textAlign="Right"
+        width="90"
+      ></e-column>
+      <e-column
+        field="totalAmount"
+        headerText="Total"
+        format="C2"
+        textAlign="Right"
+        width="130"
+      ></e-column>
+    </e-columns>
+  </ejs-grid>
+
+  <!-- PO Details dialog -->
+  <div class="po-scope" [class.scroll-locked]="dialogOpen">
+    <ejs-dialog
+      #poDialog
+      [visible]="false"
+      [isModal]="true"
+      [showCloseIcon]="true"
+      width="1200px"
+      height="80vh"
+      [allowDragging]="true"
+      [enableResize]="true"
+      [position]="{ X: 'center', Y: 'center' }"
+      (open)="onDlgOpen()"
+      (close)="onDlgClose()"
+      [header]="
+        detailHeader
+          ? 'PO ' +
+            detailHeader.poNumber +
+            ' — ' +
+            (detailHeader.vendorName || 'Vendor')
+          : 'PO Details'
+      "
+      [footerTemplate]="dlgFooter"
+    >
+      <div class="dlg-container">
+        <ng-container *ngIf="detailHeader as h">
+          <div class="dlg-body">
+            <aside class="dlg-sidebar">
+              <div class="sidebar-title">PO Approval Stages</div>
+              <ul class="stage-list">
+                <li *ngFor="let s of stages" class="stage-item">
+                  <div class="stage-row">
+                    <div class="stage-seq">{{ s.sequence }}</div>
+                    <div class="stage-meta">
+                      <div class="stage-role">{{ s.roleCode }}</div>
+                      <div class="stage-sub">
+                        <span *ngIf="s.category">Cat: {{ s.category }}</span>
+                        <span
+                          *ngIf="
+                            s.thresholdFrom != null || s.thresholdTo != null
+                          "
+                        >
+                          • {{ s.thresholdFrom ?? 0 | number : "1.0-0" }}–{{
+                            s.thresholdTo ?? 0 | number : "1.0-0"
+                          }}
+                        </span>
+                        <span *ngIf="s.decidedAtUtc">
+                          • {{ s.decidedAtUtc | date : "yMMMd HH:mm" }}</span
+                        >
+                      </div>
+                    </div>
+                    <span
+                      class="stage-pill"
+                      [class.p-a]="s.status === 'A'"
+                      [class.p-d]="s.status === 'D'"
+                      [class.p-p]="s.status === 'P'"
+                      [class.p-s]="s.status === 'S'"
+                      >{{ s.status }}</span
+                    >
+                  </div>
+                </li>
+                <li *ngIf="!stages?.length" class="muted">No stages found.</li>
+              </ul>
+            </aside>
+
+            <section class="dlg-main">
+              <div class="summary-grid">
+                <div><b>Date:</b> {{ h.poDate | date : "yyyy-MMM-dd" }}</div>
+                <div><b>Buyer:</b> {{ h.buyerName || "—" }}</div>
+                <div><b>House:</b> {{ h.houseCode || "—" }}</div>
+                <div><b>Direct:</b> {{ h.directAmount ?? 0 | currency }}</div>
+                <div>
+                  <b>Indirect:</b> {{ h.indirectAmount ?? 0 | currency }}
+                </div>
+                <div><b>Total:</b> {{ h.totalAmount ?? 0 | currency }}</div>
+              </div>
+
+              <div class="mt"><b>Lines</b></div>
+
+              <div class="lines-host">
+                <div class="lines-grid-wrap">
+                  <ejs-grid
+                    cssClass="lines-detail-grid"
+                    [dataSource]="lines"
+                    height="100%"
+                    width="100%"
+                    [allowSorting]="true"
+                    [allowResizing]="true"
+                    [allowTextWrap]="false"
+                    [allowPaging]="true"
+                    [pageSettings]="{ pageSize: 10, pageSizes: true }"
+                  >
+                    <e-columns>
+                      <e-column
+                        field="lineNumber"
+                        headerText="#"
+                        width="90"
+                        textAlign="Right"
+                      ></e-column>
+                      <e-column
+                        field="itemNumber"
+                        headerText="PrdNo"
+                        width="150"
+                      ></e-column>
+                      <e-column
+                        field="itemDescription"
+                        headerText="Description"
+                        width="360"
+                      ></e-column>
+                      <e-column
+                        field="specialDescription"
+                        headerText="Special Descr."
+                        width="280"
+                      ></e-column>
+                      <e-column
+                        field="glAccount"
+                        headerText="GL"
+                        width="160"
+                      ></e-column>
+                      <e-column
+                        field="quantityOrdered"
+                        headerText="Qty"
+                        width="120"
+                        textAlign="Right"
+                        format="N2"
+                      ></e-column>
+                      <e-column
+                        field="orderUom"
+                        headerText="UoM"
+                        width="110"
+                      ></e-column>
+                      <e-column
+                        field="unitCost"
+                        headerText="Unit"
+                        width="140"
+                        textAlign="Right"
+                        format="N4"
+                      ></e-column>
+                      <e-column
+                        field="extendedCost"
+                        headerText="Ext."
+                        width="160"
+                        textAlign="Right"
+                        format="C2"
+                      ></e-column>
+                      <e-column
+                        field="requiredDate"
+                        headerText="Required"
+                        width="160"
+                        type="date"
+                        format="yyyy-MM-dd"
+                      ></e-column>
+                    </e-columns>
+                  </ejs-grid>
+                </div>
+              </div>
+            </section>
+          </div>
+        </ng-container>
+      </div>
+    </ejs-dialog>
+  </div>
+
+  <ng-template #dlgFooter>
+    <div class="dlg-footer">
+      <button ejs-button cssClass="e-success" (click)="approve()">
+        Approve
+      </button>
+      <button ejs-button cssClass="e-danger ml" (click)="deny()">Deny</button>
+    </div>
+  </ng-template>
+
+  <!-- Add Documentation dialog -->
+  <ejs-dialog
+    #docDialog
+    [visible]="false"
+    [isModal]="true"
+    [showCloseIcon]="true"
+    width="1200px"
+    height="80vh"
+    [allowDragging]="true"
+    [enableResize]="true"
+    [position]="{ X: 'center', Y: 'center' }"
+    (open)="onDocDlgOpen()"
+    (close)="onDocDlgClose()"
+    [header]="
+      currentPoForDocs
+        ? 'Add Documentation — PO ' + currentPoForDocs.poNumber
+        : 'Add Documentation'
+    "
+    [footerTemplate]="docDlgFooter"
+  >
+    <div class="docdlg-container">
+      <div class="docdlg-body">
+        <div class="docdlg-row">
+          <label><b>Notes</b></label>
+          <textarea
+            class="docdlg-notes"
+            #notesEl
+            (input)="onNotesInput(notesEl.value)"
+          ></textarea>
+        </div>
+
+        <div class="docdlg-row">
+          <label><b>Files</b></label>
+          <ejs-uploader
+            [multiple]="true"
+            [autoUpload]="false"
+            [showFileList]="false"
+            allowedExtensions=".pdf,.doc,.docx,.xls,.xlsx,.txt"
+            (selected)="onFilesSelected($event)"
+          ></ejs-uploader>
+        </div>
+
+        <div class="docdlg-files">
+          <div *ngIf="!selectedFiles.length" class="muted">
+            No files selected.
+          </div>
+          <div
+            *ngFor="let f of selectedFiles; let i = index"
+            class="docdlg-file"
+          >
+            <div class="docdlg-file-name">{{ f.name }}</div>
+            <button
+              ejs-button
+              cssClass="e-flat"
+              (click)="removeSelectedFile(i)"
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </ejs-dialog>
+
+  <ng-template #docDlgFooter>
+    <div class="docdlg-footer">
+      <button ejs-button cssClass="e-primary" (click)="saveNotes()">
+        Save Notes
+      </button>
+      <button ejs-button cssClass="e-info" (click)="uploadSelectedFiles()">
+        Upload Files
+      </button>
+    </div>
+  </ng-template>
+</div>
+
+export interface PoHeaderView {
+  poNumber: string;
+  poDate?: string;
+  vendorName?: string;
+  buyerName?: string;
+  houseCode?: string;
+  directAmount?: number;
+  indirectAmount?: number;
+  totalAmount: number;
+  status: 'W' | 'A' | 'D';
+  isActive: boolean;
+  createdAtUtc?: string;
+  activeLineCount: number;
+}
+
+export interface PoLineView {
+  poNumber: string;
+  lineNumber: number;
+  itemNumber: string;
+  itemDescription?: string;
+  specialDescription?: string;
+  quantityOrdered?: number;
+  orderUom?: string;
+  unitCost?: number;
+  extendedCost?: number;
+  requiredDate?: string;
+  glAccount?: string;
+  isActive: boolean;
+}
+
+export interface PoStage {
+  poNumber: string;
+  sequence: number;
+  roleCode: string;
+  approverUserId?: string;
+  category?: 'I' | 'D' | null;
+  thresholdFrom?: number;
+  thresholdTo?: number;
+  status: 'P' | 'A' | 'D' | 'S';
+  decidedAtUtc?: string;
+}
+
+export interface PoListResponse {
+  total: number;
+  page: number;
+  pageSize: number;
+  rows: any[];
+}
+
+export interface PoDetailResponse {
+  header: any;
+  lines: any[];
+  stages: any[];
+  audit: any[];
+}
