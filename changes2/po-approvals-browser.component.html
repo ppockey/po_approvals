@@ -1,0 +1,330 @@
+<div class="card-container">
+  <h3 class="card-title">SFO PRMS Purchase Order Approvals</h3>
+  <br />
+
+  <ejs-grid
+    [dataSource]="poRows"
+    [allowPaging]="true"
+    [pageSettings]="{ pageSize: 20, pageSizes: true }"
+    [allowSorting]="true"
+    [allowFiltering]="false"
+    [allowSelection]="false"
+    [allowKeyboard]="false"
+    (commandClick)="onCommandClick($event)"
+  >
+    <e-columns>
+      <!-- Command column: Details + Documentation -->
+      <e-column
+        headerText="Approval Queue"
+        width="240"
+        [commands]="commands"
+        textAlign="Center"
+        headerTextAlign="Center"
+        [headerTemplate]="queueHeader"
+      ></e-column>
+
+      <ng-template #queueHeader>
+        <div class="queue">Approval Queue</div>
+      </ng-template>
+
+      <e-column field="poNumber" headerText="PO #" width="120"></e-column>
+      <e-column
+        field="poDate"
+        headerText="Date"
+        type="date"
+        format="yyyy-MM-dd"
+        width="120"
+      ></e-column>
+      <e-column field="vendorName" headerText="Vendor" width="240"></e-column>
+      <e-column field="buyerName" headerText="Buyer" width="160"></e-column>
+      <e-column field="houseCode" headerText="House" width="90"></e-column>
+
+      <e-column
+        field="directAmount"
+        headerText="Direct"
+        format="C2"
+        textAlign="Right"
+        width="120"
+      ></e-column>
+      <e-column
+        field="indirectAmount"
+        headerText="Indirect"
+        format="C2"
+        textAlign="Right"
+        width="120"
+      ></e-column>
+      <e-column
+        field="activeLineCount"
+        headerText="Lines"
+        textAlign="Right"
+        width="90"
+      ></e-column>
+      <e-column
+        field="totalAmount"
+        headerText="Total"
+        format="C2"
+        textAlign="Right"
+        width="130"
+      ></e-column>
+    </e-columns>
+  </ejs-grid>
+
+  <!-- PO Details dialog -->
+  <div class="po-scope" [class.scroll-locked]="dialogOpen">
+    <ejs-dialog
+      #poDialog
+      [visible]="false"
+      [isModal]="true"
+      [showCloseIcon]="true"
+      width="1200px"
+      height="80vh"
+      [allowDragging]="true"
+      [enableResize]="true"
+      [position]="{ X: 'center', Y: 'center' }"
+      (open)="onDlgOpen()"
+      (close)="onDlgClose()"
+      [header]="
+        detailHeader
+          ? 'PO ' +
+            detailHeader.poNumber +
+            ' — ' +
+            (detailHeader.vendorName || 'Vendor')
+          : 'PO Details'
+      "
+      [footerTemplate]="dlgFooter"
+    >
+      <div class="dlg-container">
+        <ng-container *ngIf="detailHeader as h">
+          <div class="dlg-body">
+            <aside class="dlg-sidebar">
+              <div class="sidebar-title">PO Approval Stages</div>
+              <ul class="stage-list">
+                <li *ngFor="let s of stages" class="stage-item">
+                  <div class="stage-row">
+                    <div class="stage-seq">{{ s.sequence }}</div>
+                    <div class="stage-meta">
+                      <div class="stage-role">{{ s.roleCode }}</div>
+                      <div class="stage-sub">
+                        <span *ngIf="s.category">Cat: {{ s.category }}</span>
+                        <span
+                          *ngIf="
+                            s.thresholdFrom != null || s.thresholdTo != null
+                          "
+                        >
+                          • {{ s.thresholdFrom ?? 0 | number : "1.0-0" }}–{{
+                            s.thresholdTo ?? 0 | number : "1.0-0"
+                          }}
+                        </span>
+                        <span *ngIf="s.decidedAtUtc">
+                          • {{ s.decidedAtUtc | date : "yMMMd HH:mm" }}</span
+                        >
+                      </div>
+                    </div>
+                    <span
+                      class="stage-pill"
+                      [class.p-a]="s.status === 'A'"
+                      [class.p-d]="s.status === 'D'"
+                      [class.p-p]="s.status === 'P'"
+                      [class.p-s]="s.status === 'S'"
+                      >{{ s.status }}</span
+                    >
+                  </div>
+                </li>
+                <li *ngIf="!stages?.length" class="muted">No stages found.</li>
+              </ul>
+            </aside>
+
+            <section class="dlg-main">
+              <div class="summary-grid">
+                <div><b>Date:</b> {{ h.poDate | date : "yyyy-MMM-dd" }}</div>
+                <div><b>Buyer:</b> {{ h.buyerName || "—" }}</div>
+                <div><b>House:</b> {{ h.houseCode || "—" }}</div>
+                <div><b>Direct:</b> {{ h.directAmount ?? 0 | currency }}</div>
+                <div>
+                  <b>Indirect:</b> {{ h.indirectAmount ?? 0 | currency }}
+                </div>
+                <div><b>Total:</b> {{ h.totalAmount ?? 0 | currency }}</div>
+              </div>
+
+              <div class="mt"><b>Lines</b></div>
+
+              <div class="lines-host">
+                <div class="lines-grid-wrap">
+                  <ejs-grid
+                    cssClass="lines-detail-grid"
+                    [dataSource]="lines"
+                    height="100%"
+                    width="100%"
+                    [allowSorting]="true"
+                    [allowResizing]="true"
+                    [allowTextWrap]="false"
+                    [allowPaging]="true"
+                    [pageSettings]="{ pageSize: 10, pageSizes: true }"
+                  >
+                    <e-columns>
+                      <e-column
+                        field="lineNumber"
+                        headerText="#"
+                        width="90"
+                        textAlign="Right"
+                      ></e-column>
+                      <e-column
+                        field="itemNumber"
+                        headerText="PrdNo"
+                        width="150"
+                      ></e-column>
+                      <e-column
+                        field="itemDescription"
+                        headerText="Description"
+                        width="360"
+                      ></e-column>
+                      <e-column
+                        field="specialDescription"
+                        headerText="Special Descr."
+                        width="280"
+                      ></e-column>
+                      <e-column
+                        field="glAccount"
+                        headerText="GL"
+                        width="160"
+                      ></e-column>
+                      <e-column
+                        field="quantityOrdered"
+                        headerText="Qty"
+                        width="120"
+                        textAlign="Right"
+                        format="N2"
+                      ></e-column>
+                      <e-column
+                        field="orderUom"
+                        headerText="UoM"
+                        width="110"
+                      ></e-column>
+                      <e-column
+                        field="unitCost"
+                        headerText="Unit"
+                        width="140"
+                        textAlign="Right"
+                        format="N4"
+                      ></e-column>
+                      <e-column
+                        field="extendedCost"
+                        headerText="Ext."
+                        width="160"
+                        textAlign="Right"
+                        format="C2"
+                      ></e-column>
+                      <e-column
+                        field="requiredDate"
+                        headerText="Required"
+                        width="160"
+                        type="date"
+                        format="yyyy-MM-dd"
+                      ></e-column>
+                    </e-columns>
+                  </ejs-grid>
+                </div>
+              </div>
+            </section>
+          </div>
+        </ng-container>
+      </div>
+    </ejs-dialog>
+  </div>
+
+  <ng-template #dlgFooter>
+    <div class="dlg-footer">
+      <button
+        ejs-button
+        cssClass="e-success"
+        (click)="approve()"
+        [disabled]="findMyPendingSequence() === null"
+      >
+        Approve
+      </button>
+      <button
+        ejs-button
+        cssClass="e-danger ml"
+        (click)="deny()"
+        [disabled]="findMyPendingSequence() === null"
+      >
+        Deny
+      </button>
+    </div>
+  </ng-template>
+
+  <!-- Add Documentation dialog -->
+  <ejs-dialog
+    #docDialog
+    [visible]="false"
+    [isModal]="true"
+    [showCloseIcon]="true"
+    width="1200px"
+    height="80vh"
+    [allowDragging]="true"
+    [enableResize]="true"
+    [position]="{ X: 'center', Y: 'center' }"
+    (open)="onDocDlgOpen()"
+    (close)="onDocDlgClose()"
+    [header]="
+      currentPoForDocs
+        ? 'Add Documentation — PO ' + currentPoForDocs.poNumber
+        : 'Add Documentation'
+    "
+    [footerTemplate]="docDlgFooter"
+  >
+    <div class="docdlg-container">
+      <div class="docdlg-body">
+        <div class="docdlg-row">
+          <label><b>Notes</b></label>
+          <textarea
+            class="docdlg-notes"
+            #notesEl
+            (input)="onNotesInput(notesEl.value)"
+          ></textarea>
+        </div>
+
+        <div class="docdlg-row">
+          <label><b>Files</b></label>
+          <ejs-uploader
+            [multiple]="true"
+            [autoUpload]="false"
+            [showFileList]="false"
+            allowedExtensions=".pdf,.doc,.docx,.xls,.xlsx,.txt"
+            (selected)="onFilesSelected($event)"
+          ></ejs-uploader>
+        </div>
+
+        <div class="docdlg-files">
+          <div *ngIf="!selectedFiles.length" class="muted">
+            No files selected.
+          </div>
+          <div
+            *ngFor="let f of selectedFiles; let i = index"
+            class="docdlg-file"
+          >
+            <div class="docdlg-file-name">{{ f.name }}</div>
+            <button
+              ejs-button
+              cssClass="e-flat"
+              (click)="removeSelectedFile(i)"
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </ejs-dialog>
+
+  <ng-template #docDlgFooter>
+    <div class="docdlg-footer">
+      <button ejs-button cssClass="e-primary" (click)="saveNotes()">
+        Save Notes
+      </button>
+      <button ejs-button cssClass="e-info" (click)="uploadSelectedFiles()">
+        Upload Files
+      </button>
+    </div>
+  </ng-template>
+</div>
