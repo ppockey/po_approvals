@@ -5,7 +5,6 @@ import {
   HttpParams,
 } from '@angular/common/http';
 import { DialogComponent } from '@syncfusion/ej2-angular-popups';
-import { ToastComponent } from '@syncfusion/ej2-angular-notifications';
 import {
   CommandModel,
   CommandClickEventArgs,
@@ -32,16 +31,11 @@ export class PoApprovalsBrowserComponent {
   public stages: PoStage[] = [];
   public dialogOpen = false;
 
-  // Busy/disabled state during approve/deny
-  public decidingAction: 'approve' | 'deny' | null = null;
-
-  // Highlight stage just decided
-  private lastDecision:
-    | { poNumber: string; sequence: number; status: 'A' | 'D'; atMs: number }
-    | null = null;
-
   // Max length for decision note (DecisionNote column limit)
   public readonly decisionNoteMaxLength = 4000;
+
+  // NEW: lock approve/deny after a successful decision for the currently-open PO
+  public decisionLocked = false;
 
   // Command column buttons (used by template)
   public commands: CommandModel[] = [
@@ -80,9 +74,6 @@ export class PoApprovalsBrowserComponent {
   @ViewChild('docDialog', { static: false })
   private docDialog?: DialogComponent;
 
-  @ViewChild('toast', { static: false })
-  private toast?: ToastComponent;
-
   // ────────────────────── Construction & lifecycle ───────────────────────────
   public constructor(private http: HttpClient) {}
 
@@ -95,6 +86,7 @@ export class PoApprovalsBrowserComponent {
       .set('page', '1')
       .set('pageSize', '20')
       .set('email', this.userEmail);
+
     this.http.get<PoListResponse>('/api/po', { params }).subscribe((resp) => {
       const rows = (resp?.rows ?? []).map(this.toHeader);
       this.poRows = rows;
@@ -124,36 +116,6 @@ export class PoApprovalsBrowserComponent {
   public onDlgClose(): void {
     this.dialogOpen = false;
     this.unfreezePageScroll();
-  }
-
-  // ────────────────────── Toast helpers ──────────────────────
-
-  private showToast(title: string, content: string, cssClass: string): void {
-    // Toast is optional; if module/import is missing, app should still work.
-    this.toast?.show({ title, content, cssClass });
-  }
-
-  // ────────────────────── Stage highlight helpers ──────────────────────
-
-  public isStageJustDecided(s: PoStage): boolean {
-    if (!this.lastDecision) return false;
-    if (s.poNumber !== this.lastDecision.poNumber) return false;
-    if (s.sequence !== this.lastDecision.sequence) return false;
-
-    // Highlight window (ms)
-    const age = Date.now() - this.lastDecision.atMs;
-    return age >= 0 && age <= 8000;
-  }
-
-  private markStageJustDecided(poNumber: string, sequence: number, status: 'A' | 'D'): void {
-    this.lastDecision = { poNumber, sequence, status, atMs: Date.now() };
-
-    // Auto-clear after the highlight window so it doesn’t “stick”
-    window.setTimeout(() => {
-      if (!this.lastDecision) return;
-      const age = Date.now() - this.lastDecision.atMs;
-      if (age > 8000) this.lastDecision = null;
-    }, 8200);
   }
 
   // ────────────────────── Docs dialog helpers ──────────────────────
@@ -289,8 +251,6 @@ export class PoApprovalsBrowserComponent {
 
   public approve(): void {
     if (!this.detailHeader) return;
-    if (this.decidingAction) return;
-
     const seq = this.findMyPendingSequence();
     if (seq == null) {
       alert('No pending stage for you on this PO.');
@@ -299,37 +259,31 @@ export class PoApprovalsBrowserComponent {
 
     const poNumber = this.detailHeader.poNumber;
     const noteSource =
-      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
+      this.noteCache[poNumber] != null
+        ? this.noteCache[poNumber]
+        : this.notesText;
     const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
 
-    this.decidingAction = 'approve';
-    this.markStageJustDecided(poNumber, seq, 'A');
-
     const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/approve`;
-    const sub = this.http.post(url, { userId: this.userEmail, note }).subscribe({
+    this.http.post(url, { userId: this.userEmail, note }).subscribe({
       next: () => {
+        // NEW: keep approve/deny disabled after success
+        this.decisionLocked = true;
+
         // After approval, clear note from memory for this PO
         delete this.noteCache[poNumber];
         this.notesText = '';
 
-        // Explicit success cue
-        this.showToast('Approved', `PO ${poNumber} stage ${seq} approved.`, 'toast-ok');
-
-        this.loadDetails(poNumber);
+        this.loadDetails(this.detailHeader!.poNumber);
         // refresh the queue:
         this.ngOnInit();
       },
       error: (err) => this.showHttpError(err),
     });
-
-    sub.add(() => {
-      this.decidingAction = null;
-    });
   }
 
   public deny(): void {
     if (!this.detailHeader) return;
-    if (this.decidingAction) return;
 
     const seq = this.findMyPendingSequence();
     if (seq == null) {
@@ -339,29 +293,23 @@ export class PoApprovalsBrowserComponent {
 
     const poNumber = this.detailHeader.poNumber;
     const noteSource =
-      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
+      this.noteCache[poNumber] != null
+        ? this.noteCache[poNumber]
+        : this.notesText;
     const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
 
-    this.decidingAction = 'deny';
-    this.markStageJustDecided(poNumber, seq, 'D');
-
     const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/deny`;
-    const sub = this.http.post(url, { userId: this.userEmail, note }).subscribe({
+    this.http.post(url, { userId: this.userEmail, note }).subscribe({
       next: () => {
+        // NEW: keep approve/deny disabled after success
+        this.decisionLocked = true;
+
         delete this.noteCache[poNumber];
         this.notesText = '';
-
-        // Explicit success cue
-        this.showToast('Denied', `PO ${poNumber} stage ${seq} denied.`, 'toast-bad');
-
         this.loadDetails(poNumber);
         this.ngOnInit();
       },
       error: (err) => this.showHttpError(err),
-    });
-
-    sub.add(() => {
-      this.decidingAction = null;
     });
   }
 
@@ -414,6 +362,10 @@ export class PoApprovalsBrowserComponent {
 
   private loadDetails(poNumber: string, fallbackRow?: any): void {
     if (!poNumber) return;
+
+    // NEW: when loading details (open PO or refresh), allow decision again until one succeeds
+    this.decisionLocked = false;
+
     this.http
       .get<PoDetailResponse>(`/api/po/${encodeURIComponent(poNumber)}`)
       .subscribe((d) => {
