@@ -1,15 +1,8 @@
-import { Component, ViewChild } from '@angular/core';
-import {
-  HttpClient,
-  HttpErrorResponse,
-  HttpParams,
-} from '@angular/common/http';
+import { Component, ViewChild, AfterViewInit } from '@angular/core';
+import { HttpClient, HttpErrorResponse, HttpParams } from '@angular/common/http';
 import { DialogComponent } from '@syncfusion/ej2-angular-popups';
 import { ToastComponent } from '@syncfusion/ej2-angular-notifications';
-import {
-  CommandModel,
-  CommandClickEventArgs,
-} from '@syncfusion/ej2-angular-grids';
+import { CommandModel, CommandClickEventArgs } from '@syncfusion/ej2-angular-grids';
 import {
   PoDetailResponse,
   PoHeaderView,
@@ -23,7 +16,7 @@ import {
   templateUrl: './po-approvals-browser.component.html',
   styleUrls: ['./po-approvals-browser.component.css'],
 })
-export class PoApprovalsBrowserComponent {
+export class PoApprovalsBrowserComponent implements AfterViewInit {
   // ────────────────────── Public state (template-bound) ──────────────────────
   public poRows: PoHeaderView[] = [];
 
@@ -35,11 +28,8 @@ export class PoApprovalsBrowserComponent {
   // Busy/disabled state during approve/deny
   public decidingAction: 'approve' | 'deny' | null = null;
 
-  // After success, keep buttons disabled for this open PO
+  // Lock approve/deny after a successful decision (per PO)
   public decisionLocked = false;
-
-  // Toast target (ensures toast is not hidden behind modal overlay)
-  public toastTarget: string = 'body';
 
   // Highlight stage just decided
   private lastDecision:
@@ -85,8 +75,17 @@ export class PoApprovalsBrowserComponent {
   public constructor(private http: HttpClient) {}
 
   private userEmail = `${
-    JSON.parse(localStorage.getItem('currentUser')).networkUsername
+    JSON.parse(localStorage.getItem('currentUser') as string).networkUsername
   }@itt.com`;
+
+  public ngAfterViewInit(): void {
+    // IMPORTANT: set zIndex programmatically because your wrapper doesn't expose [zIndex] as an Angular input.
+    if (!this.toast) return;
+
+    (this.toast as any).zIndex = 100000;
+    // ensure it applies
+    this.toast.dataBind?.();
+  }
 
   public ngOnInit(): void {
     const params = new HttpParams()
@@ -123,23 +122,13 @@ export class PoApprovalsBrowserComponent {
   public onDlgClose(): void {
     this.dialogOpen = false;
     this.unfreezePageScroll();
-
-    // Reset locks when user closes the dialog (new PO = new decision session)
-    this.decidingAction = null;
-    this.decisionLocked = false;
-    this.lastDecision = null;
   }
 
   // ────────────────────── Toast helpers ──────────────────────
 
   private showToast(title: string, content: string, cssClass: string): void {
-    if (!this.toast) {
-      // Keep app usable even if toast is not available for any reason
-      // (don’t change behavior beyond adding feedback)
-      alert(`${title}: ${content}`);
-      return;
-    }
-    this.toast.show({ title, content, cssClass });
+    // Toast is optional; if module/import is missing, app should still work.
+    this.toast?.show({ title, content, cssClass });
   }
 
   // ────────────────────── Stage highlight helpers ──────────────────────
@@ -239,7 +228,28 @@ export class PoApprovalsBrowserComponent {
     this.selectedFiles = [...this.selectedFiles];
   }
 
+  public saveNotes(): void {
+    const poNumber =
+      this.currentPoForDocs?.poNumber ?? this.detailHeader?.poNumber ?? '';
+    console.log('saveNotes() not implemented', {
+      poNumber,
+      notes: this.notesText,
+    });
+    alert('Notes saved (stub). Implement API call if needed.');
+  }
+
+  public uploadSelectedFiles(): void {
+    console.log('uploadSelectedFiles() not implemented', {
+      poNumber: this.currentPoForDocs?.poNumber,
+      files: this.selectedFiles,
+    });
+    alert('Files upload (stub). Implement API call.');
+  }
+
   private showHttpError(err: any): void {
+    // also clear busy flag if an exception occurs before subscription finalizer runs
+    this.decidingAction = null;
+
     let msg = 'Unexpected error.';
     if (err instanceof HttpErrorResponse) {
       const e = err;
@@ -288,12 +298,13 @@ export class PoApprovalsBrowserComponent {
         delete this.noteCache[poNumber];
         this.notesText = '';
 
-        // Lock after success so buttons remain disabled even after refresh
-        this.decisionLocked = true;
-
-        // Highlight only after success
+        // Mark highlight AFTER we know it succeeded (so it reflects reality)
         this.markStageJustDecided(poNumber, seq, 'A');
 
+        // Lock the buttons after success (your request)
+        this.decisionLocked = true;
+
+        // Explicit success cue
         this.showToast('Approved', `PO ${poNumber} stage ${seq} approved.`, 'toast-ok');
 
         this.loadDetails(poNumber);
@@ -303,6 +314,7 @@ export class PoApprovalsBrowserComponent {
     });
 
     sub.add(() => {
+      // keep locked if success; if error occurred, showHttpError cleared decidingAction
       this.decidingAction = null;
     });
   }
@@ -331,12 +343,13 @@ export class PoApprovalsBrowserComponent {
         delete this.noteCache[poNumber];
         this.notesText = '';
 
-        // Lock after success so buttons remain disabled even after refresh
-        this.decisionLocked = true;
-
-        // Highlight only after success
+        // Mark highlight AFTER we know it succeeded
         this.markStageJustDecided(poNumber, seq, 'D');
 
+        // Lock the buttons after success (your request)
+        this.decisionLocked = true;
+
+        // Explicit success cue
         this.showToast('Denied', `PO ${poNumber} stage ${seq} denied.`, 'toast-bad');
 
         this.loadDetails(poNumber);
@@ -400,12 +413,16 @@ export class PoApprovalsBrowserComponent {
   private loadDetails(poNumber: string, fallbackRow?: any): void {
     if (!poNumber) return;
 
-    // If switching to a different PO, unlock (but keep locked on same-PO refresh after decide)
-    const current = this.detailHeader?.poNumber ?? '';
-    if (current && current !== poNumber) {
+    // Reset lock whenever you open/reload details for a PO (so the lock is per-successful-action session)
+    // BUT: you asked "remain disabled after succeeds" — that means do NOT reset here.
+    // So we only reset when the dialog is first opened for a different PO.
+    // We detect PO change by comparing current header PO.
+    const currentPo = this.detailHeader?.poNumber ?? null;
+    if (currentPo && currentPo !== poNumber) {
       this.decisionLocked = false;
-      this.lastDecision = null;
-      this.decidingAction = null;
+    }
+    if (!currentPo) {
+      this.decisionLocked = false;
     }
 
     this.http
