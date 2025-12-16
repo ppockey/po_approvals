@@ -5,6 +5,7 @@ import {
   HttpParams,
 } from '@angular/common/http';
 import { DialogComponent } from '@syncfusion/ej2-angular-popups';
+import { ToastComponent } from '@syncfusion/ej2-angular-notifications';
 import {
   CommandModel,
   CommandClickEventArgs,
@@ -31,11 +32,22 @@ export class PoApprovalsBrowserComponent {
   public stages: PoStage[] = [];
   public dialogOpen = false;
 
+  // Busy/disabled state during approve/deny
+  public decidingAction: 'approve' | 'deny' | null = null;
+
+  // After success, keep buttons disabled for this open PO
+  public decisionLocked = false;
+
+  // Toast target (ensures toast is not hidden behind modal overlay)
+  public toastTarget: string = 'body';
+
+  // Highlight stage just decided
+  private lastDecision:
+    | { poNumber: string; sequence: number; status: 'A' | 'D'; atMs: number }
+    | null = null;
+
   // Max length for decision note (DecisionNote column limit)
   public readonly decisionNoteMaxLength = 4000;
-
-  // NEW: lock approve/deny after a successful decision for the currently-open PO
-  public decisionLocked = false;
 
   // Command column buttons (used by template)
   public commands: CommandModel[] = [
@@ -43,14 +55,6 @@ export class PoApprovalsBrowserComponent {
       type: 'None',
       buttonOption: { content: 'Details', cssClass: 'e-primary cmd-view' },
     },
-    // Documentation at row-level (currently unused – docs now opened from details)
-    // {
-    //   type: 'None',
-    //   buttonOption: {
-    //     content: 'Documentation',
-    //     cssClass: 'e-info cmd-docs ml',
-    //   },
-    // },
   ];
 
   // Docs dialog state (template reads these)
@@ -73,6 +77,9 @@ export class PoApprovalsBrowserComponent {
 
   @ViewChild('docDialog', { static: false })
   private docDialog?: DialogComponent;
+
+  @ViewChild('toast', { static: false })
+  private toast?: ToastComponent;
 
   // ────────────────────── Construction & lifecycle ───────────────────────────
   public constructor(private http: HttpClient) {}
@@ -116,13 +123,52 @@ export class PoApprovalsBrowserComponent {
   public onDlgClose(): void {
     this.dialogOpen = false;
     this.unfreezePageScroll();
+
+    // Reset locks when user closes the dialog (new PO = new decision session)
+    this.decidingAction = null;
+    this.decisionLocked = false;
+    this.lastDecision = null;
+  }
+
+  // ────────────────────── Toast helpers ──────────────────────
+
+  private showToast(title: string, content: string, cssClass: string): void {
+    if (!this.toast) {
+      // Keep app usable even if toast is not available for any reason
+      // (don’t change behavior beyond adding feedback)
+      alert(`${title}: ${content}`);
+      return;
+    }
+    this.toast.show({ title, content, cssClass });
+  }
+
+  // ────────────────────── Stage highlight helpers ──────────────────────
+
+  public isStageJustDecided(s: PoStage): boolean {
+    if (!this.lastDecision) return false;
+    if (s.poNumber !== this.lastDecision.poNumber) return false;
+    if (s.sequence !== this.lastDecision.sequence) return false;
+
+    const age = Date.now() - this.lastDecision.atMs;
+    return age >= 0 && age <= 8000;
+  }
+
+  private markStageJustDecided(
+    poNumber: string,
+    sequence: number,
+    status: 'A' | 'D'
+  ): void {
+    this.lastDecision = { poNumber, sequence, status, atMs: Date.now() };
+
+    window.setTimeout(() => {
+      if (!this.lastDecision) return;
+      const age = Date.now() - this.lastDecision.atMs;
+      if (age > 8000) this.lastDecision = null;
+    }, 8200);
   }
 
   // ────────────────────── Docs dialog helpers ──────────────────────
 
-  /**
-   * Open docs dialog from a row in the grid (if used).
-   */
   public openDocsForRow(row: any): void {
     const header = this.toHeader(row ?? {});
     this.currentPoForDocs = header;
@@ -134,14 +180,8 @@ export class PoApprovalsBrowserComponent {
     this.docDialog?.show();
   }
 
-  /**
-   * Open docs dialog for the PO currently shown in the details dialog.
-   * Used by the link in the details dialog footer.
-   */
   public openDocsFromDetail(): void {
-    if (!this.detailHeader) {
-      return;
-    }
+    if (!this.detailHeader) return;
 
     this.currentPoForDocs = this.detailHeader;
     const poNumber = this.detailHeader.poNumber;
@@ -152,16 +192,12 @@ export class PoApprovalsBrowserComponent {
     this.docDialog?.show();
   }
 
-  /**
-   * Position docs dialog a bit up and to the right of the details dialog.
-   */
   private positionDocsOverDetails(): void {
     if (!this.poDialog) return;
     const hostElem = this.poDialog.element as HTMLElement | null;
     if (!hostElem) return;
 
     const rect = hostElem.getBoundingClientRect();
-    // Offset: 15% from left and 10% from top of the details dialog
     const x = rect.left + rect.width * 0.15;
     const y = rect.top + rect.height * 0.1;
 
@@ -169,20 +205,17 @@ export class PoApprovalsBrowserComponent {
   }
 
   public onDocDlgOpen(): void {
-    this.onDlgOpen(); // reuse scroll lock
+    this.onDlgOpen();
     this.positionDocsOverDetails();
   }
 
   public onDocDlgClose(): void {
-    this.onDlgClose(); // reuse scroll unlock
+    this.onDlgClose();
     this.currentPoForDocs = null;
     this.notesText = '';
     this.selectedFiles = [];
   }
 
-  /**
-   * Keep notesText in sync, enforce max length, and store per-PO in memory.
-   */
   public onNotesInput(value: string): void {
     const trimmed = (value ?? '').slice(0, this.decisionNoteMaxLength);
     this.notesText = trimmed;
@@ -204,24 +237,6 @@ export class PoApprovalsBrowserComponent {
   public removeSelectedFile(idx: number): void {
     this.selectedFiles.splice(idx, 1);
     this.selectedFiles = [...this.selectedFiles];
-  }
-
-  public saveNotes(): void {
-    const poNumber =
-      this.currentPoForDocs?.poNumber ?? this.detailHeader?.poNumber ?? '';
-    console.log('saveNotes() not implemented', {
-      poNumber,
-      notes: this.notesText,
-    });
-    alert('Notes saved (stub). Implement API call if needed.');
-  }
-
-  public uploadSelectedFiles(): void {
-    console.log('uploadSelectedFiles() not implemented', {
-      poNumber: this.currentPoForDocs?.poNumber,
-      files: this.selectedFiles,
-    });
-    alert('Files upload (stub). Implement API call.');
   }
 
   private showHttpError(err: any): void {
@@ -251,6 +266,9 @@ export class PoApprovalsBrowserComponent {
 
   public approve(): void {
     if (!this.detailHeader) return;
+    if (this.decidingAction) return;
+    if (this.decisionLocked) return;
+
     const seq = this.findMyPendingSequence();
     if (seq == null) {
       alert('No pending stage for you on this PO.');
@@ -259,31 +277,40 @@ export class PoApprovalsBrowserComponent {
 
     const poNumber = this.detailHeader.poNumber;
     const noteSource =
-      this.noteCache[poNumber] != null
-        ? this.noteCache[poNumber]
-        : this.notesText;
+      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
     const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
 
-    const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/approve`;
-    this.http.post(url, { userId: this.userEmail, note }).subscribe({
-      next: () => {
-        // NEW: keep approve/deny disabled after success
-        this.decisionLocked = true;
+    this.decidingAction = 'approve';
 
-        // After approval, clear note from memory for this PO
+    const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/approve`;
+    const sub = this.http.post(url, { userId: this.userEmail, note }).subscribe({
+      next: () => {
         delete this.noteCache[poNumber];
         this.notesText = '';
 
-        this.loadDetails(this.detailHeader!.poNumber);
-        // refresh the queue:
+        // Lock after success so buttons remain disabled even after refresh
+        this.decisionLocked = true;
+
+        // Highlight only after success
+        this.markStageJustDecided(poNumber, seq, 'A');
+
+        this.showToast('Approved', `PO ${poNumber} stage ${seq} approved.`, 'toast-ok');
+
+        this.loadDetails(poNumber);
         this.ngOnInit();
       },
       error: (err) => this.showHttpError(err),
+    });
+
+    sub.add(() => {
+      this.decidingAction = null;
     });
   }
 
   public deny(): void {
     if (!this.detailHeader) return;
+    if (this.decidingAction) return;
+    if (this.decisionLocked) return;
 
     const seq = this.findMyPendingSequence();
     if (seq == null) {
@@ -293,23 +320,33 @@ export class PoApprovalsBrowserComponent {
 
     const poNumber = this.detailHeader.poNumber;
     const noteSource =
-      this.noteCache[poNumber] != null
-        ? this.noteCache[poNumber]
-        : this.notesText;
+      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
     const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
 
-    const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/deny`;
-    this.http.post(url, { userId: this.userEmail, note }).subscribe({
-      next: () => {
-        // NEW: keep approve/deny disabled after success
-        this.decisionLocked = true;
+    this.decidingAction = 'deny';
 
+    const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/deny`;
+    const sub = this.http.post(url, { userId: this.userEmail, note }).subscribe({
+      next: () => {
         delete this.noteCache[poNumber];
         this.notesText = '';
+
+        // Lock after success so buttons remain disabled even after refresh
+        this.decisionLocked = true;
+
+        // Highlight only after success
+        this.markStageJustDecided(poNumber, seq, 'D');
+
+        this.showToast('Denied', `PO ${poNumber} stage ${seq} denied.`, 'toast-bad');
+
         this.loadDetails(poNumber);
         this.ngOnInit();
       },
       error: (err) => this.showHttpError(err),
+    });
+
+    sub.add(() => {
+      this.decidingAction = null;
     });
   }
 
@@ -363,8 +400,13 @@ export class PoApprovalsBrowserComponent {
   private loadDetails(poNumber: string, fallbackRow?: any): void {
     if (!poNumber) return;
 
-    // NEW: when loading details (open PO or refresh), allow decision again until one succeeds
-    this.decisionLocked = false;
+    // If switching to a different PO, unlock (but keep locked on same-PO refresh after decide)
+    const current = this.detailHeader?.poNumber ?? '';
+    if (current && current !== poNumber) {
+      this.decisionLocked = false;
+      this.lastDecision = null;
+      this.decidingAction = null;
+    }
 
     this.http
       .get<PoDetailResponse>(`/api/po/${encodeURIComponent(poNumber)}`)
@@ -383,8 +425,7 @@ export class PoApprovalsBrowserComponent {
 
   private freezePageScroll(): void {
     if (this.lockDepth++ > 0) return;
-    if (typeof window === 'undefined' || typeof document === 'undefined')
-      return;
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
     this.scrollY = window.scrollY || window.pageYOffset || 0;
     const b = document.body;
@@ -406,8 +447,7 @@ export class PoApprovalsBrowserComponent {
 
   private unfreezePageScroll(): void {
     if (--this.lockDepth > 0) return;
-    if (typeof window === 'undefined' || typeof document === 'undefined')
-      return;
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
     const b = document.body;
     b.style.position = this.bodyStyleBackup.position ?? '';
