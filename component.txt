@@ -1,0 +1,469 @@
+import { Component, ViewChild } from '@angular/core';
+import {
+  HttpClient,
+  HttpErrorResponse,
+  HttpParams,
+} from '@angular/common/http';
+import { DialogComponent } from '@syncfusion/ej2-angular-popups';
+import { ToastComponent } from '@syncfusion/ej2-angular-notifications';
+import {
+  CommandModel,
+  CommandClickEventArgs,
+} from '@syncfusion/ej2-angular-grids';
+import {
+  PoDetailResponse,
+  PoHeaderView,
+  PoLineView,
+  PoListResponse,
+  PoStage,
+} from 'src/app/core/models/poapprovals/poapprovals_models';
+
+@Component({
+  selector: 'app-po-approvals-browser',
+  templateUrl: './po-approvals-browser.component.html',
+  styleUrls: ['./po-approvals-browser.component.css'],
+})
+export class PoApprovalsBrowserComponent {
+  // ────────────────────── Public state (template-bound) ──────────────────────
+  public poRows: PoHeaderView[] = [];
+
+  public detailHeader: PoHeaderView | null = null;
+  public lines: PoLineView[] = [];
+  public stages: PoStage[] = [];
+  public dialogOpen = false;
+
+  // Busy/disabled state during approve/deny
+  public decidingAction: 'approve' | 'deny' | null = null;
+
+  // Highlight stage just decided
+  private lastDecision:
+    | { poNumber: string; sequence: number; status: 'A' | 'D'; atMs: number }
+    | null = null;
+
+  // Max length for decision note (DecisionNote column limit)
+  public readonly decisionNoteMaxLength = 4000;
+
+  // Command column buttons (used by template)
+  public commands: CommandModel[] = [
+    {
+      type: 'None',
+      buttonOption: { content: 'Details', cssClass: 'e-primary cmd-view' },
+    },
+    // Documentation at row-level (currently unused – docs now opened from details)
+    // {
+    //   type: 'None',
+    //   buttonOption: {
+    //     content: 'Documentation',
+    //     cssClass: 'e-info cmd-docs ml',
+    //   },
+    // },
+  ];
+
+  // Docs dialog state (template reads these)
+  public currentPoForDocs: PoHeaderView | null = null;
+  public notesText: string = '';
+  public selectedFiles: File[] = [];
+
+  // Position for docs dialog; updated to sit over the details dialog
+  public docDialogPosition: { X: number | string; Y: number | string } = {
+    X: 'center',
+    Y: 'center',
+  };
+
+  // In-memory cache of notes keyed by PO number
+  private noteCache: { [poNumber: string]: string } = {};
+
+  // ────────────────────── Private template refs ──────────────────────────────
+  @ViewChild('poDialog', { static: false })
+  private poDialog?: DialogComponent;
+
+  @ViewChild('docDialog', { static: false })
+  private docDialog?: DialogComponent;
+
+  @ViewChild('toast', { static: false })
+  private toast?: ToastComponent;
+
+  // ────────────────────── Construction & lifecycle ───────────────────────────
+  public constructor(private http: HttpClient) {}
+
+  private userEmail = `${
+    JSON.parse(localStorage.getItem('currentUser')).networkUsername
+  }@itt.com`;
+
+  public ngOnInit(): void {
+    const params = new HttpParams()
+      .set('page', '1')
+      .set('pageSize', '20')
+      .set('email', this.userEmail);
+    this.http.get<PoListResponse>('/api/po', { params }).subscribe((resp) => {
+      const rows = (resp?.rows ?? []).map(this.toHeader);
+      this.poRows = rows;
+    });
+  }
+
+  public onCommandClick(args: CommandClickEventArgs): void {
+    const row: any = args.rowData;
+    const target = args.target as HTMLElement | null;
+    const poNumber: string = row?.poNumber ?? row?.PoNumber ?? '';
+
+    if (target?.classList.contains('cmd-view')) {
+      this.loadDetails(poNumber, row);
+      return;
+    }
+    if (target?.classList.contains('cmd-docs')) {
+      this.openDocsForRow(row);
+      return;
+    }
+  }
+
+  public onDlgOpen(): void {
+    this.dialogOpen = true;
+    this.freezePageScroll();
+  }
+
+  public onDlgClose(): void {
+    this.dialogOpen = false;
+    this.unfreezePageScroll();
+  }
+
+  // ────────────────────── Toast helpers ──────────────────────
+
+  private showToast(title: string, content: string, cssClass: string): void {
+    // Toast is optional; if module/import is missing, app should still work.
+    this.toast?.show({ title, content, cssClass });
+  }
+
+  // ────────────────────── Stage highlight helpers ──────────────────────
+
+  public isStageJustDecided(s: PoStage): boolean {
+    if (!this.lastDecision) return false;
+    if (s.poNumber !== this.lastDecision.poNumber) return false;
+    if (s.sequence !== this.lastDecision.sequence) return false;
+
+    // Highlight window (ms)
+    const age = Date.now() - this.lastDecision.atMs;
+    return age >= 0 && age <= 8000;
+  }
+
+  private markStageJustDecided(poNumber: string, sequence: number, status: 'A' | 'D'): void {
+    this.lastDecision = { poNumber, sequence, status, atMs: Date.now() };
+
+    // Auto-clear after the highlight window so it doesn’t “stick”
+    window.setTimeout(() => {
+      if (!this.lastDecision) return;
+      const age = Date.now() - this.lastDecision.atMs;
+      if (age > 8000) this.lastDecision = null;
+    }, 8200);
+  }
+
+  // ────────────────────── Docs dialog helpers ──────────────────────
+
+  /**
+   * Open docs dialog from a row in the grid (if used).
+   */
+  public openDocsForRow(row: any): void {
+    const header = this.toHeader(row ?? {});
+    this.currentPoForDocs = header;
+
+    const poNumber = header.poNumber;
+    this.notesText = this.noteCache[poNumber] ?? '';
+    this.selectedFiles = [];
+
+    this.docDialog?.show();
+  }
+
+  /**
+   * Open docs dialog for the PO currently shown in the details dialog.
+   * Used by the link in the details dialog footer.
+   */
+  public openDocsFromDetail(): void {
+    if (!this.detailHeader) {
+      return;
+    }
+
+    this.currentPoForDocs = this.detailHeader;
+    const poNumber = this.detailHeader.poNumber;
+
+    this.notesText = this.noteCache[poNumber] ?? '';
+    this.selectedFiles = [];
+
+    this.docDialog?.show();
+  }
+
+  /**
+   * Position docs dialog a bit up and to the right of the details dialog.
+   */
+  private positionDocsOverDetails(): void {
+    if (!this.poDialog) return;
+    const hostElem = this.poDialog.element as HTMLElement | null;
+    if (!hostElem) return;
+
+    const rect = hostElem.getBoundingClientRect();
+    // Offset: 15% from left and 10% from top of the details dialog
+    const x = rect.left + rect.width * 0.15;
+    const y = rect.top + rect.height * 0.1;
+
+    this.docDialogPosition = { X: x, Y: y };
+  }
+
+  public onDocDlgOpen(): void {
+    this.onDlgOpen(); // reuse scroll lock
+    this.positionDocsOverDetails();
+  }
+
+  public onDocDlgClose(): void {
+    this.onDlgClose(); // reuse scroll unlock
+    this.currentPoForDocs = null;
+    this.notesText = '';
+    this.selectedFiles = [];
+  }
+
+  /**
+   * Keep notesText in sync, enforce max length, and store per-PO in memory.
+   */
+  public onNotesInput(value: string): void {
+    const trimmed = (value ?? '').slice(0, this.decisionNoteMaxLength);
+    this.notesText = trimmed;
+
+    const poNumber =
+      this.currentPoForDocs?.poNumber ?? this.detailHeader?.poNumber ?? null;
+    if (poNumber) {
+      this.noteCache[poNumber] = trimmed;
+    }
+  }
+
+  public onFilesSelected(args: any): void {
+    const list: File[] = Array.from(
+      (args?.event?.target?.files ?? []) as FileList
+    );
+    this.selectedFiles = list;
+  }
+
+  public removeSelectedFile(idx: number): void {
+    this.selectedFiles.splice(idx, 1);
+    this.selectedFiles = [...this.selectedFiles];
+  }
+
+  public saveNotes(): void {
+    const poNumber =
+      this.currentPoForDocs?.poNumber ?? this.detailHeader?.poNumber ?? '';
+    console.log('saveNotes() not implemented', {
+      poNumber,
+      notes: this.notesText,
+    });
+    alert('Notes saved (stub). Implement API call if needed.');
+  }
+
+  public uploadSelectedFiles(): void {
+    console.log('uploadSelectedFiles() not implemented', {
+      poNumber: this.currentPoForDocs?.poNumber,
+      files: this.selectedFiles,
+    });
+    alert('Files upload (stub). Implement API call.');
+  }
+
+  private showHttpError(err: any): void {
+    let msg = 'Unexpected error.';
+    if (err instanceof HttpErrorResponse) {
+      const e = err;
+      const pd = (e.error || {}) as any;
+      if (pd && (pd.title || pd.detail)) {
+        msg = `${pd.title ?? 'Error'}${pd.detail ? `: ${pd.detail}` : ''}`;
+      } else if (typeof e.error === 'string') {
+        msg = e.error;
+      } else if (e.message) {
+        msg = `${e.status || ''} ${e.statusText || ''} ${e.message}`.trim();
+      }
+    } else if (typeof err === 'string') {
+      msg = err;
+    } else if (err && err.message) {
+      msg = err.message;
+    }
+    alert(msg);
+  }
+
+  public findMyPendingSequence(): number | null {
+    const s = this.stages.find((x) => x.status === 'P');
+    return s ? s.sequence : null;
+  }
+
+  public approve(): void {
+    if (!this.detailHeader) return;
+    if (this.decidingAction) return;
+
+    const seq = this.findMyPendingSequence();
+    if (seq == null) {
+      alert('No pending stage for you on this PO.');
+      return;
+    }
+
+    const poNumber = this.detailHeader.poNumber;
+    const noteSource =
+      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
+    const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
+
+    this.decidingAction = 'approve';
+    this.markStageJustDecided(poNumber, seq, 'A');
+
+    const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/approve`;
+    const sub = this.http.post(url, { userId: this.userEmail, note }).subscribe({
+      next: () => {
+        // After approval, clear note from memory for this PO
+        delete this.noteCache[poNumber];
+        this.notesText = '';
+
+        // Explicit success cue
+        this.showToast('Approved', `PO ${poNumber} stage ${seq} approved.`, 'toast-ok');
+
+        this.loadDetails(poNumber);
+        // refresh the queue:
+        this.ngOnInit();
+      },
+      error: (err) => this.showHttpError(err),
+    });
+
+    sub.add(() => {
+      this.decidingAction = null;
+    });
+  }
+
+  public deny(): void {
+    if (!this.detailHeader) return;
+    if (this.decidingAction) return;
+
+    const seq = this.findMyPendingSequence();
+    if (seq == null) {
+      alert('No pending stage for you on this PO.');
+      return;
+    }
+
+    const poNumber = this.detailHeader.poNumber;
+    const noteSource =
+      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
+    const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
+
+    this.decidingAction = 'deny';
+    this.markStageJustDecided(poNumber, seq, 'D');
+
+    const url = `/api/po/${encodeURIComponent(poNumber)}/stages/${seq}/deny`;
+    const sub = this.http.post(url, { userId: this.userEmail, note }).subscribe({
+      next: () => {
+        delete this.noteCache[poNumber];
+        this.notesText = '';
+
+        // Explicit success cue
+        this.showToast('Denied', `PO ${poNumber} stage ${seq} denied.`, 'toast-bad');
+
+        this.loadDetails(poNumber);
+        this.ngOnInit();
+      },
+      error: (err) => this.showHttpError(err),
+    });
+
+    sub.add(() => {
+      this.decidingAction = null;
+    });
+  }
+
+  // ────────────────────── mapping & API ─────────────────────
+  private toHeader = (h: any): PoHeaderView => ({
+    poNumber: h.poNumber ?? h.PoNumber ?? '',
+    poDate: h.poDate ?? h.PoDate,
+    vendorName: h.vendorName ?? h.VendorName,
+    buyerName: h.buyerName ?? h.BuyerName,
+    houseCode: h.houseCode ?? h.HouseCode,
+    directAmount: h.directAmount ?? h.DirectAmount ?? 0,
+    indirectAmount: h.indirectAmount ?? h.IndirectAmount ?? 0,
+    totalAmount:
+      h.totalAmount ??
+      h.TotalAmount ??
+      (h.directAmount ?? h.DirectAmount ?? 0) +
+        (h.indirectAmount ?? h.IndirectAmount ?? 0),
+    status: (h.status ?? h.Status ?? 'W') as 'W' | 'A' | 'D',
+    isActive: (h.isActive ?? h.IsActive ?? true) as boolean,
+    createdAtUtc: h.createdAtUtc ?? h.CreatedAtUtc,
+    activeLineCount: h.activeLineCount ?? h.ActiveLineCount ?? 0,
+  });
+
+  private toLine = (l: any): PoLineView => ({
+    poNumber: l.poNumber ?? l.PoNumber ?? '',
+    lineNumber: l.lineNumber ?? l.LineNumber ?? 0,
+    itemNumber: l.itemNumber ?? l.ItemNumber ?? '',
+    itemDescription: l.itemDescription ?? l.ItemDescription,
+    specialDescription: l.specialDescription ?? l.SpecialDescription,
+    quantityOrdered: l.quantityOrdered ?? l.QuantityOrdered,
+    orderUom: l.orderUom ?? l.OrderUom,
+    unitCost: l.unitCost ?? l.UnitCost,
+    extendedCost: l.extendedCost ?? l.ExtendedCost,
+    requiredDate: l.requiredDate ?? l.RequiredDate,
+    glAccount: l.glAccount ?? l.GlAccount,
+    isActive: (l.isActive ?? l.IsActive ?? true) as boolean,
+  });
+
+  private toStage = (s: any): PoStage => ({
+    poNumber: s.poNumber ?? s.PoNumber ?? '',
+    sequence: s.sequence ?? s.Sequence ?? 0,
+    roleCode: s.roleCode ?? s.RoleCode ?? '',
+    approverUserId: s.approverUserId ?? s.ApproverUserId,
+    category: (s.category ?? s.Category ?? null) as 'I' | 'D' | null,
+    thresholdFrom: s.thresholdFrom ?? s.ThresholdFrom,
+    thresholdTo: s.thresholdTo ?? s.ThresholdTo,
+    status: (s.status ?? s.Status ?? 'P') as 'P' | 'A' | 'D' | 'S',
+    decidedAtUtc: s.decidedAtUtc ?? s.DecidedAtUtc,
+  });
+
+  private loadDetails(poNumber: string, fallbackRow?: any): void {
+    if (!poNumber) return;
+    this.http
+      .get<PoDetailResponse>(`/api/po/${encodeURIComponent(poNumber)}`)
+      .subscribe((d) => {
+        this.detailHeader = this.toHeader(d?.header ?? fallbackRow ?? {});
+        this.lines = (d?.lines ?? []).map(this.toLine);
+        this.stages = (d?.stages ?? []).map(this.toStage);
+        this.poDialog?.show();
+      });
+  }
+
+  // ────────────────────── page scroll locking ───────────────────────
+  private scrollY = 0;
+  private bodyStyleBackup: Partial<CSSStyleDeclaration> = {};
+  private lockDepth = 0;
+
+  private freezePageScroll(): void {
+    if (this.lockDepth++ > 0) return;
+    if (typeof window === 'undefined' || typeof document === 'undefined')
+      return;
+
+    this.scrollY = window.scrollY || window.pageYOffset || 0;
+    const b = document.body;
+    this.bodyStyleBackup = {
+      position: b.style.position,
+      overflow: b.style.overflow,
+      width: b.style.width,
+      top: b.style.top,
+      left: b.style.left,
+      right: b.style.right,
+    };
+    b.style.position = 'fixed';
+    b.style.overflow = 'hidden';
+    b.style.width = '100%';
+    b.style.top = `-${this.scrollY}px`;
+    b.style.left = '0';
+    b.style.right = '0';
+  }
+
+  private unfreezePageScroll(): void {
+    if (--this.lockDepth > 0) return;
+    if (typeof window === 'undefined' || typeof document === 'undefined')
+      return;
+
+    const b = document.body;
+    b.style.position = this.bodyStyleBackup.position ?? '';
+    b.style.overflow = this.bodyStyleBackup.overflow ?? '';
+    b.style.width = this.bodyStyleBackup.width ?? '';
+    b.style.top = this.bodyStyleBackup.top ?? '';
+    b.style.left = this.bodyStyleBackup.left ?? '';
+    b.style.right = this.bodyStyleBackup.right ?? '';
+    window.scrollTo(0, this.scrollY);
+  }
+}
