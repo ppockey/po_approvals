@@ -146,12 +146,10 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
 
   // ────────────────────── Toast helpers ──────────────────────
   private showToast(title: string, content: string, cssClass: string): void {
-    // Toast is optional; if module/import is missing, app should still work.
     this.toast?.show({ title, content, cssClass });
   }
 
   // ────────────────────── Category label helpers ──────────────────────
-
   public getCategoryLabel(s: PoStage): string {
     if (s.category === 'I') return 'Indirect';
     if (s.category === 'D') return 'Direct';
@@ -159,7 +157,6 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
   }
 
   // ────────────────────── Stage effective status (UI override) ──────────────────────
-
   private stageKey(poNumber: string, sequence: number): string {
     return `${poNumber}::${sequence}`;
   }
@@ -178,8 +175,32 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
     this.stageStatusOverrides = {};
   }
 
-  // ────────────────────── Stage highlight helpers ──────────────────────
+  // ────────────────────── Effective header status (fix for W staying yellow) ──────────────────────
+  public getEffectiveHeaderStatus(): 'W' | 'A' | 'D' {
+    const h = this.detailHeader;
+    if (!h) return 'W';
 
+    // If backend already finalized the header, trust it.
+    if (h.status === 'A' || h.status === 'D') return h.status;
+
+    // If header says W but stages clearly indicate final state, infer for UI.
+    if (!this.stages || this.stages.length === 0) return h.status;
+
+    const effectiveStatuses = this.stages.map((s) => this.getEffectiveStageStatus(s));
+
+    // Any denied stage => denied PO (visual cue)
+    if (effectiveStatuses.some((st) => st === 'D')) return 'D';
+
+    // Fully done when no pending stages remain and all are A or S
+    const hasPending = effectiveStatuses.some((st) => st === 'P');
+    const allDone = effectiveStatuses.every((st) => st === 'A' || st === 'S');
+
+    if (!hasPending && allDone) return 'A';
+
+    return h.status; // usually W
+  }
+
+  // ────────────────────── Stage highlight helpers ──────────────────────
   public isStageJustDecided(s: PoStage): boolean {
     if (!this.lastDecision) return false;
     if (s.poNumber !== this.lastDecision.poNumber) return false;
@@ -214,7 +235,6 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
   }
 
   // ────────────────────── Docs dialog helpers ──────────────────────
-
   public openDocsForRow(row: any): void {
     const header = this.toHeader(row ?? {});
     this.currentPoForDocs = header;
@@ -285,26 +305,7 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
     this.selectedFiles = [...this.selectedFiles];
   }
 
-  public saveNotes(): void {
-    const poNumber =
-      this.currentPoForDocs?.poNumber ?? this.detailHeader?.poNumber ?? '';
-    console.log('saveNotes() not implemented', {
-      poNumber,
-      notes: this.notesText,
-    });
-    alert('Notes saved (stub). Implement API call if needed.');
-  }
-
-  public uploadSelectedFiles(): void {
-    console.log('uploadSelectedFiles() not implemented', {
-      poNumber: this.currentPoForDocs?.poNumber,
-      files: this.selectedFiles,
-    });
-    alert('Files upload (stub). Implement API call.');
-  }
-
   private showHttpError(err: any): void {
-    // also clear busy flag if an exception occurs before subscription finalizer runs
     this.decidingAction = null;
 
     let msg = 'Unexpected error.';
@@ -344,9 +345,7 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
 
     const poNumber = this.detailHeader.poNumber;
     const noteSource =
-      this.noteCache[poNumber] != null
-        ? this.noteCache[poNumber]
-        : this.notesText;
+      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
     const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
 
     this.decidingAction = 'approve';
@@ -359,18 +358,11 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
           delete this.noteCache[poNumber];
           this.notesText = '';
 
-          // UI override + highlight AFTER success
           this.setStageOverride(poNumber, seq, 'A');
           this.markStageJustDecided(poNumber, seq, 'A');
-
-          // Lock the buttons after success
           this.decisionLocked = true;
 
-          this.showToast(
-            'Approved',
-            `PO ${poNumber} stage ${seq} approved.`,
-            'toast-ok'
-          );
+          this.showToast('Approved', `PO ${poNumber} stage ${seq} approved.`, 'toast-ok');
 
           this.loadDetails(poNumber);
           this.ngOnInit();
@@ -396,9 +388,7 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
 
     const poNumber = this.detailHeader.poNumber;
     const noteSource =
-      this.noteCache[poNumber] != null
-        ? this.noteCache[poNumber]
-        : this.notesText;
+      this.noteCache[poNumber] != null ? this.noteCache[poNumber] : this.notesText;
     const note = (noteSource ?? '').slice(0, this.decisionNoteMaxLength);
 
     this.decidingAction = 'deny';
@@ -411,18 +401,11 @@ export class PoApprovalsBrowserComponent implements AfterViewInit {
           delete this.noteCache[poNumber];
           this.notesText = '';
 
-          // UI override + highlight AFTER success
           this.setStageOverride(poNumber, seq, 'D');
           this.markStageJustDecided(poNumber, seq, 'D');
-
-          // Lock the buttons after success
           this.decisionLocked = true;
 
-          this.showToast(
-            'Denied',
-            `PO ${poNumber} stage ${seq} denied.`,
-            'toast-bad'
-          );
+          this.showToast('Denied', `PO ${poNumber} stage ${seq} denied.`, 'toast-bad');
 
           this.loadDetails(poNumber);
           this.ngOnInit();
